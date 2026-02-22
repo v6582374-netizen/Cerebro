@@ -146,5 +146,6 @@ wechat-agent view --mode source --interactive
 - 标题点击使用原始完整链接（保留全部 query 参数，避免参数丢失）。
 - 若终端对外链有安全拦截，使用 `wechat-agent open --article-id <id>` 强制调用系统浏览器打开。
 - AI 摘要优先基于正文全文提取后总结；正文抓取失败时自动回退。
+- 已移除 `--test-prev-day` 测试参数，日期归类统一由发布时刻规则自动处理。
 - 每次命令输出末尾都会显示当前 AI 引擎信息，例如：
   - `AI: provider=openai | summary=gpt-4o-mini | embedding=text-embedding-3-small`

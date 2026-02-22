@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from enum import Enum
 import re
 import sys
@@ -492,11 +492,6 @@ def view(
         "--interactive/--no-interactive",
         help="view后进入已读交互模式。默认在TTY环境自动开启。",
     ),
-    test_prev_day: bool = typer.Option(
-        False,
-        "--test-prev-day",
-        help="仅测试用：未传 --date 时，抓取并展示前一天数据。后续会移除该参数。",
-    ),
 ) -> None:
     """先同步后展示文章列表。"""
 
@@ -508,9 +503,6 @@ def view(
         raise typer.BadParameter("mode 必须是 source/time/recommend")
 
     target_date = _parse_date(date_text)
-    if test_prev_day and date_text is None:
-        target_date = target_date - timedelta(days=1)
-        typer.echo("测试模式: 已切换为前一天数据。")
 
     provider, sync_service = _build_runtime()
     interactive_enabled = interactive
@@ -625,7 +617,6 @@ def quick_show(
     mode: ViewMode | None = typer.Option(None, "--mode", "-m"),
     date_text: str | None = typer.Option(None, "--date", "-d"),
     interactive: bool | None = typer.Option(None, "--interactive/--no-interactive"),
-    test_prev_day: bool = typer.Option(False, "--test-prev-day"),
 ) -> None:
     """快捷命令：查看文章（会先同步）。"""
 
@@ -633,7 +624,6 @@ def quick_show(
         mode=mode,
         date_text=date_text,
         interactive=interactive,
-        test_prev_day=test_prev_day,
     )
 
 

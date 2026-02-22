@@ -73,20 +73,6 @@ def test_cli_view_modes_and_read_mark(isolated_env, monkeypatch):
     assert "AI: provider=" in recommend_after_mark.stdout
 
 
-def test_cli_test_prev_day_switch(isolated_env, monkeypatch):
-    monkeypatch.setattr("wechat_agent.providers.template_feed_provider.TemplateFeedProvider.fetch", _fake_fetch)
-    monkeypatch.setattr("wechat_agent.providers.template_feed_provider.TemplateFeedProvider.probe", _fake_probe)
-    monkeypatch.setattr(Summarizer, "summarize", _fake_summary)
-
-    add = runner.invoke(app, ["sub", "add", "--name", "号A", "--wechat-id", "gh_a"])
-    assert add.exit_code == 0
-
-    out = runner.invoke(app, ["view", "--mode", "source", "--test-prev-day"])
-    assert out.exit_code == 0
-    assert "测试模式: 已切换为前一天数据。" in out.stdout
-    assert "AI: provider=" in out.stdout
-
-
 def test_cli_view_interactive_read_toggle(isolated_env, monkeypatch):
     monkeypatch.setattr("wechat_agent.providers.template_feed_provider.TemplateFeedProvider.fetch", _fake_fetch)
     monkeypatch.setattr("wechat_agent.providers.template_feed_provider.TemplateFeedProvider.probe", _fake_probe)
