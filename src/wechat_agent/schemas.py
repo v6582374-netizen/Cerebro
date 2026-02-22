@@ -45,7 +45,8 @@ class RecommendationScore:
 
 @dataclass(slots=True)
 class ArticleViewItem:
-    article_id: int
+    day_id: int
+    article_pk: int
     source_name: str
     published_at: datetime
     title: str

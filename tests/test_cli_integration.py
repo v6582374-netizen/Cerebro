@@ -65,7 +65,7 @@ def test_cli_view_modes_and_read_mark(isolated_env, monkeypatch):
     assert "AI: provider=" in time_out.stdout
     assert "AI: provider=" in recommend_out.stdout
 
-    mark = runner.invoke(app, ["read", "mark", "--article-id", "1", "--state", "read"])
+    mark = runner.invoke(app, ["read", "mark", "--id", "1", "--date", today, "--state", "read"])
     assert mark.exit_code == 0
     assert "AI: provider=" in mark.stdout
 
@@ -103,7 +103,7 @@ def test_cli_view_interactive_read_toggle(isolated_env, monkeypatch):
 def test_non_view_commands_append_ai_footer(isolated_env):
     empty_list = runner.invoke(app, ["sub", "list"])
     empty_status = runner.invoke(app, ["status"])
-    not_found = runner.invoke(app, ["read", "mark", "--article-id", "999", "--state", "read"])
+    not_found = runner.invoke(app, ["read", "mark", "--id", "999", "--state", "read"])
 
     assert empty_list.exit_code == 0
     assert empty_status.exit_code == 0
@@ -131,11 +131,11 @@ def test_quick_alias_commands(isolated_env, monkeypatch):
     assert show_out.exit_code == 0
     assert "CLI 集成测试文章" in show_out.stdout
 
-    done_out = runner.invoke(app, ["done", "-i", "1"])
+    done_out = runner.invoke(app, ["done", "-i", "1", "--date", today])
     assert done_out.exit_code == 0
     assert "已批量更新 1 篇文章状态为: read" in done_out.stdout
 
-    todo_out = runner.invoke(app, ["todo", "-i", "1"])
+    todo_out = runner.invoke(app, ["todo", "-i", "1", "--date", today])
     assert todo_out.exit_code == 0
     assert "已批量更新 1 篇文章状态为: unread" in todo_out.stdout
 
@@ -152,10 +152,32 @@ def test_open_command(isolated_env, monkeypatch):
     assert show.exit_code == 0
 
     monkeypatch.setattr("wechat_agent.cli.webbrowser.open", lambda *_args, **_kwargs: True)
-    opened = runner.invoke(app, ["open", "--article-id", "1"])
+    opened = runner.invoke(app, ["open", "--id", "1", "--date", today])
     assert opened.exit_code == 0
     assert "已尝试打开文章:" in opened.stdout
     assert "AI: provider=" in opened.stdout
+
+
+def test_history_does_not_trigger_sync(isolated_env, monkeypatch):
+    monkeypatch.setattr("wechat_agent.providers.template_feed_provider.TemplateFeedProvider.fetch", _fake_fetch)
+    monkeypatch.setattr("wechat_agent.providers.template_feed_provider.TemplateFeedProvider.probe", _fake_probe)
+    monkeypatch.setattr(Summarizer, "summarize", _fake_summary)
+
+    add = runner.invoke(app, ["add", "-n", "号A", "-i", "gh_a"])
+    assert add.exit_code == 0
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    first_view = runner.invoke(app, ["view", "--mode", "source", "--date", today, "--no-interactive"])
+    assert first_view.exit_code == 0
+
+    monkeypatch.setattr(
+        "wechat_agent.providers.template_feed_provider.TemplateFeedProvider.fetch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("history should not fetch")),
+    )
+    history_out = runner.invoke(app, ["history", "--mode", "source", "--date", today, "--no-interactive"])
+    assert history_out.exit_code == 0
+    assert "历史查询:" in history_out.stdout
+    assert "CLI 集成测试文章" in history_out.stdout
 
 
 def test_config_api_interactive_writes_env(isolated_env):

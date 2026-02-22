@@ -110,6 +110,8 @@ def _build_runtime():
         fetcher=fetcher,
         summarizer=summarizer,
         recommender=recommender,
+        sync_overlap_seconds=settings.sync_overlap_seconds,
+        incremental_sync_enabled=settings.incremental_sync_enabled,
     )
     return provider, sync_service
 
@@ -150,6 +152,7 @@ def _round_robin_by_source(items: list[ArticleViewItem]) -> list[ArticleViewItem
 
 def _query_article_items(session, target_date: date, mode: str) -> list[ArticleViewItem]:
     day_start, day_end = _day_bounds(target_date)
+    day_id_by_article_pk, _ = _build_day_id_maps(session=session, target_date=target_date)
 
     stmt = (
         select(
@@ -210,7 +213,8 @@ def _query_article_items(session, target_date: date, mode: str) -> list[ArticleV
     rows = session.execute(stmt).all()
     items = [
         ArticleViewItem(
-            article_id=row[0],
+            day_id=day_id_by_article_pk.get(int(row[0]), 0),
+            article_pk=row[0],
             source_name=row[1],
             published_at=row[2],
             title=row[3],
@@ -229,6 +233,43 @@ def _query_article_items(session, target_date: date, mode: str) -> list[ArticleV
             items = _round_robin_by_source(items)
 
     return items
+
+
+def _build_day_id_maps(session, target_date: date) -> tuple[dict[int, int], dict[int, int]]:
+    day_start, day_end = _day_bounds(target_date)
+    rows = session.execute(
+        select(Article.id)
+        .where(and_(Article.published_at >= day_start, Article.published_at < day_end))
+        .order_by(Article.published_at.desc(), Article.id.asc())
+    ).all()
+    by_article_pk: dict[int, int] = {}
+    by_day_id: dict[int, int] = {}
+    for idx, (article_id,) in enumerate(rows, start=1):
+        article_pk = int(article_id)
+        by_article_pk[article_pk] = idx
+        by_day_id[idx] = article_pk
+    return by_article_pk, by_day_id
+
+
+def _resolve_article_pk_by_day_id(session, target_date: date, day_id: int) -> int | None:
+    if day_id <= 0:
+        return None
+    _, by_day_id = _build_day_id_maps(session=session, target_date=target_date)
+    return by_day_id.get(day_id)
+
+
+def _resolve_article_pks_by_day_ids(
+    session,
+    target_date: date,
+    day_ids: list[int],
+) -> dict[int, int]:
+    _, by_day_id = _build_day_id_maps(session=session, target_date=target_date)
+    resolved: dict[int, int] = {}
+    for day_id in day_ids:
+        article_pk = by_day_id.get(day_id)
+        if article_pk is not None:
+            resolved[day_id] = article_pk
+    return resolved
 
 
 def _render_subscription_table(subscriptions: list[Subscription]) -> str:
@@ -341,7 +382,7 @@ def _mask_secret(value: str | None) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
-def _bulk_mark_read(ids_raw: str, is_read: bool) -> None:
+def _bulk_mark_read(ids_raw: str, is_read: bool, target_date: date) -> None:
     settings = get_settings()
     init_db(settings)
     service = ReadStateService()
@@ -355,12 +396,21 @@ def _bulk_mark_read(ids_raw: str, is_read: bool) -> None:
 
     changed = 0
     with session_scope(settings) as session:
-        for article_id in ids:
-            article = session.get(Article, article_id)
-            if article is None:
-                typer.echo(f"文章不存在: {article_id}")
+        resolved_map = _resolve_article_pks_by_day_ids(
+            session=session,
+            target_date=target_date,
+            day_ids=ids,
+        )
+        for day_id in ids:
+            article_pk = resolved_map.get(day_id)
+            if article_pk is None:
+                typer.echo(f"文章不存在: day_id={day_id}, date={target_date.isoformat()}")
                 continue
-            service.mark(session=session, article_id=article_id, is_read=is_read)
+            article = session.get(Article, article_pk)
+            if article is None:
+                typer.echo(f"文章不存在: day_id={day_id}, date={target_date.isoformat()}")
+                continue
+            service.mark(session=session, article_id=article_pk, is_read=is_read)
             changed += 1
         if changed > 0:
             session.commit()
@@ -405,26 +455,41 @@ def _interactive_read_loop(
             continue
 
         try:
-            ids = _parse_id_list(payload)
+            day_ids = _parse_id_list(payload)
         except ValueError as exc:
             typer.echo(str(exc))
             continue
 
+        resolved_map = _resolve_article_pks_by_day_ids(
+            session=session,
+            target_date=target_date,
+            day_ids=day_ids,
+        )
+
         if op == "o":
-            article_id = ids[0]
-            article = session.get(Article, article_id)
+            day_id = day_ids[0]
+            article_pk = resolved_map.get(day_id)
+            if article_pk is None:
+                typer.echo(f"文章不存在: day_id={day_id}, date={target_date.isoformat()}")
+                continue
+            article = session.get(Article, article_pk)
             if article is None:
-                typer.echo(f"文章不存在: {article_id}")
+                typer.echo(f"文章不存在: day_id={day_id}, date={target_date.isoformat()}")
                 continue
             ok = webbrowser.open(article.url, new=2)
             typer.echo("已尝试打开浏览器。" if ok else "浏览器打开请求已发送（终端可能限制反馈）。")
             continue
 
         changed = 0
-        for article_id in ids:
-            article = session.get(Article, article_id)
+        for day_id in day_ids:
+            article_pk = resolved_map.get(day_id)
+            if article_pk is None:
+                typer.echo(f"文章不存在: day_id={day_id}, date={target_date.isoformat()}")
+                continue
+
+            article = session.get(Article, article_pk)
             if article is None:
-                typer.echo(f"文章不存在: {article_id}")
+                typer.echo(f"文章不存在: day_id={day_id}, date={target_date.isoformat()}")
                 continue
 
             if op == "r":
@@ -432,10 +497,10 @@ def _interactive_read_loop(
             elif op == "u":
                 is_read = False
             else:
-                existing = session.get(ReadState, article_id)
+                existing = session.get(ReadState, article_pk)
                 is_read = not (existing.is_read if existing else False)
 
-            service.mark(session=session, article_id=article_id, is_read=is_read)
+            service.mark(session=session, article_id=article_pk, is_read=is_read)
             changed += 1
 
         if changed == 0:
@@ -701,44 +766,107 @@ def view(
     _echo_ai_footer(settings)
 
 
-@read_app.command("mark")
-def read_mark(
-    article_id: int = typer.Option(..., "--article-id"),
-    state: ReadStateValue = typer.Option(..., "--state"),
+@app.command("history")
+def history(
+    date_text: str = typer.Option(..., "--date", help="YYYY-MM-DD（必填）"),
+    mode: ViewMode | None = typer.Option(None, "--mode", help="source/time/recommend"),
+    interactive: bool | None = typer.Option(
+        None,
+        "--interactive/--no-interactive",
+        help="history后进入已读交互模式。默认在TTY环境自动开启。",
+    ),
 ) -> None:
-    """标记文章已读/未读。"""
+    """按日期查询历史文章（只查库，不触发抓取）。"""
 
     settings = get_settings()
     init_db(settings)
+
+    mode_value = (mode.value if mode else settings.default_view_mode).lower()
+    if mode_value not in {"source", "time", "recommend"}:
+        raise typer.BadParameter("mode 必须是 source/time/recommend")
+
+    target_date = _parse_date(date_text)
+    interactive_enabled = interactive
+    if interactive_enabled is None:
+        interactive_enabled = sys.stdin.isatty() and sys.stdout.isatty()
+
+    with session_scope(settings) as session:
+        items = _query_article_items(session=session, target_date=target_date, mode=mode_value)
+        rendered = render_article_items(items=items, mode=mode_value)
+        typer.echo(f"历史查询: date={target_date.isoformat()}, mode={mode_value}")
+        typer.echo(rendered, nl=False)
+        if interactive_enabled and items:
+            _interactive_read_loop(
+                session=session,
+                target_date=target_date,
+                mode_value=mode_value,
+            )
+    _echo_ai_footer(settings)
+
+
+@read_app.command("mark")
+def read_mark(
+    day_id: int = typer.Option(..., "--id", "-i"),
+    date_text: str | None = typer.Option(None, "--date", help="YYYY-MM-DD，默认当天"),
+    state: ReadStateValue = typer.Option(..., "--state"),
+) -> None:
+    """按日内ID标记文章已读/未读。"""
+
+    settings = get_settings()
+    init_db(settings)
+    target_date = _parse_date(date_text)
 
     is_read = state.value == "read"
     service = ReadStateService()
 
     with session_scope(settings) as session:
-        article = session.get(Article, article_id)
-        if article is None:
-            typer.echo(f"文章不存在: {article_id}")
+        article_pk = _resolve_article_pk_by_day_id(
+            session=session,
+            target_date=target_date,
+            day_id=day_id,
+        )
+        if article_pk is None:
+            typer.echo(f"文章不存在: day_id={day_id}, date={target_date.isoformat()}")
             _echo_ai_footer(settings)
             return
 
-        service.mark(session=session, article_id=article_id, is_read=is_read)
+        article = session.get(Article, article_pk)
+        if article is None:
+            typer.echo(f"文章不存在: day_id={day_id}, date={target_date.isoformat()}")
+            _echo_ai_footer(settings)
+            return
+
+        service.mark(session=session, article_id=article_pk, is_read=is_read)
         session.commit()
-        typer.echo(f"已更新文章 {article_id} 状态为: {'read' if is_read else 'unread'}")
+        typer.echo(
+            f"已更新文章状态: date={target_date.isoformat()}, id={day_id}, state={'read' if is_read else 'unread'}"
+        )
     _echo_ai_footer(settings)
 
 
 @app.command("open")
 def open_article(
-    article_id: int = typer.Option(..., "--article-id", "-i"),
+    day_id: int = typer.Option(..., "--id", "-i"),
+    date_text: str | None = typer.Option(None, "--date", help="YYYY-MM-DD，默认当天"),
 ) -> None:
-    """直接在系统浏览器中打开原文。"""
+    """按日内ID在系统浏览器中打开原文。"""
 
     settings = get_settings()
     init_db(settings)
+    target_date = _parse_date(date_text)
     with session_scope(settings) as session:
-        article = session.get(Article, article_id)
+        article_pk = _resolve_article_pk_by_day_id(
+            session=session,
+            target_date=target_date,
+            day_id=day_id,
+        )
+        if article_pk is None:
+            typer.echo(f"文章不存在: day_id={day_id}, date={target_date.isoformat()}")
+            _echo_ai_footer(settings)
+            return
+        article = session.get(Article, article_pk)
         if article is None:
-            typer.echo(f"文章不存在: {article_id}")
+            typer.echo(f"文章不存在: day_id={day_id}, date={target_date.isoformat()}")
             _echo_ai_footer(settings)
             return
         ok = webbrowser.open(article.url, new=2)
@@ -802,19 +930,21 @@ def quick_show(
 @app.command("done")
 def quick_done(
     ids: str = typer.Option(..., "--ids", "-i", help="逗号分隔，如 1,2,3"),
+    date_text: str | None = typer.Option(None, "--date", "-d", help="YYYY-MM-DD，默认当天"),
 ) -> None:
     """快捷命令：批量标记已读。"""
 
-    _bulk_mark_read(ids_raw=ids, is_read=True)
+    _bulk_mark_read(ids_raw=ids, is_read=True, target_date=_parse_date(date_text))
 
 
 @app.command("todo")
 def quick_todo(
     ids: str = typer.Option(..., "--ids", "-i", help="逗号分隔，如 1,2,3"),
+    date_text: str | None = typer.Option(None, "--date", "-d", help="YYYY-MM-DD，默认当天"),
 ) -> None:
     """快捷命令：批量标记未读。"""
 
-    _bulk_mark_read(ids_raw=ids, is_read=False)
+    _bulk_mark_read(ids_raw=ids, is_read=False, target_date=_parse_date(date_text))
 
 
 def main() -> None:

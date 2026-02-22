@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import and_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -33,11 +33,15 @@ class SyncService:
         fetcher: Fetcher,
         summarizer: Summarizer,
         recommender: Recommender,
+        sync_overlap_seconds: int = 120,
+        incremental_sync_enabled: bool = True,
     ) -> None:
         self.resolver = resolver
         self.fetcher = fetcher
         self.summarizer = summarizer
         self.recommender = recommender
+        self.sync_overlap_seconds = max(sync_overlap_seconds, 0)
+        self.incremental_sync_enabled = incremental_sync_enabled
 
     def sync(self, session: Session, target_date: date, trigger: str = "view") -> SyncRun:
         run = SyncRun(trigger=trigger, started_at=utcnow(), success_count=0, fail_count=0)
@@ -45,18 +49,61 @@ class SyncService:
         session.flush()
 
         day_start, _ = local_day_bounds_utc(target_date)
+        last_success_map = self._last_success_time_by_subscription(session)
+        new_article_ids: list[int] = []
 
         subscriptions = session.scalars(select(Subscription).order_by(Subscription.id.asc())).all()
         for sub in subscriptions:
-            self._sync_subscription(session=session, run=run, sub=sub, since=day_start)
+            since = day_start
+            if self.incremental_sync_enabled:
+                last_success = last_success_map.get(sub.id)
+                if last_success is not None:
+                    overlap = timedelta(seconds=self.sync_overlap_seconds)
+                    since = max(day_start, last_success - overlap)
+            self._sync_subscription(
+                session=session,
+                run=run,
+                sub=sub,
+                since=since,
+                new_article_ids=new_article_ids,
+            )
 
-        self._refresh_low_quality_summaries(session=session, target_date=target_date)
+        self._refresh_low_quality_summaries(session=session, article_ids=new_article_ids)
         self.recommender.recompute_scores_for_date(session=session, target_date=target_date)
 
         run.finished_at = utcnow()
         return run
 
-    def _sync_subscription(self, session: Session, run: SyncRun, sub: Subscription, since: datetime) -> None:
+    def _last_success_time_by_subscription(self, session: Session) -> dict[int, datetime]:
+        stmt = (
+            select(SyncRunItem.subscription_id, SyncRun.finished_at)
+            .join(SyncRun, SyncRun.id == SyncRunItem.sync_run_id)
+            .where(
+                SyncRunItem.status == SYNC_ITEM_STATUS_SUCCESS,
+                SyncRun.finished_at.is_not(None),
+            )
+            .order_by(SyncRun.finished_at.desc())
+        )
+        result: dict[int, datetime] = {}
+        for subscription_id, finished_at in session.execute(stmt).all():
+            if subscription_id in result:
+                continue
+            if finished_at is None:
+                continue
+            value = finished_at
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            result[int(subscription_id)] = value
+        return result
+
+    def _sync_subscription(
+        self,
+        session: Session,
+        run: SyncRun,
+        sub: Subscription,
+        since: datetime,
+        new_article_ids: list[int],
+    ) -> None:
         result = self.resolver.resolve(sub)
         if not result.ok or not result.source_url:
             sub.source_status = SOURCE_STATUS_MATCH_FAILED
@@ -95,10 +142,11 @@ class SyncService:
 
         new_count = 0
         for raw in raw_articles:
-            inserted = self._upsert_article(session=session, sub=sub, raw=raw)
-            if not inserted:
+            article_id = self._upsert_article(session=session, sub=sub, raw=raw)
+            if article_id is None:
                 continue
             new_count += 1
+            new_article_ids.append(article_id)
 
         run.success_count += 1
         session.add(
@@ -111,7 +159,7 @@ class SyncService:
             )
         )
 
-    def _upsert_article(self, session: Session, sub: Subscription, raw: RawArticle) -> bool:
+    def _upsert_article(self, session: Session, sub: Subscription, raw: RawArticle) -> int | None:
         existing = session.scalar(
             select(Article).where(
                 Article.subscription_id == sub.id,
@@ -129,7 +177,7 @@ class SyncService:
                 existing.content_excerpt = raw.content_excerpt
             if (raw.raw_hash or "") and existing.raw_hash != raw.raw_hash:
                 existing.raw_hash = raw.raw_hash
-            return False
+            return None
 
         published_at = raw.published_at
         if published_at.tzinfo is None:
@@ -163,14 +211,15 @@ class SyncService:
             article_id=article.id,
             text=embedding_text,
         )
-        return True
+        return article.id
 
-    def _refresh_low_quality_summaries(self, session: Session, target_date: date) -> None:
-        day_start, day_end = local_day_bounds_utc(target_date)
+    def _refresh_low_quality_summaries(self, session: Session, article_ids: list[int]) -> None:
+        if not article_ids:
+            return
         stmt = (
             select(Article, ArticleSummary)
             .outerjoin(ArticleSummary, ArticleSummary.article_id == Article.id)
-            .where(and_(Article.published_at >= day_start, Article.published_at < day_end))
+            .where(Article.id.in_(article_ids))
         )
 
         for article, summary in session.execute(stmt).all():

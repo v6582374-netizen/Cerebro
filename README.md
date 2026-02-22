@@ -72,6 +72,10 @@ DEEPSEEK_EMBED_MODEL=
 
 # 业务规则：00:00 发布时间按后两天归类（例如 23号00:00 -> 25号）
 MIDNIGHT_SHIFT_DAYS=2
+
+# 同步优化：每次 view 只增量抓取（基于上次成功同步时间）
+SYNC_OVERLAP_SECONDS=120
+INCREMENTAL_SYNC_ENABLED=true
 ```
 
 说明：
@@ -101,17 +105,27 @@ wechat-agent view --mode time --date 2026-02-22
 
 # 按推荐
 wechat-agent view --mode recommend
+
+# 历史查询（只查库，不触发抓取；date 必填）
+wechat-agent history --date 2026-02-22 --mode source
 ```
 
 已读管理：
 
 ```bash
-# 单条
-wechat-agent read mark --article-id 12 --state read
-wechat-agent read mark --article-id 12 --state unread
+# 单条（使用“当日ID”，可配合 --date 查询历史日）
+wechat-agent read mark --id 1 --state read
+wechat-agent read mark --id 1 --state unread
+wechat-agent read mark --date 2026-02-22 --id 3 --state read
 
-# 在系统浏览器打开原文
-wechat-agent open --article-id 12
+# 批量
+wechat-agent done --ids 1,2,3
+wechat-agent todo --ids 2
+wechat-agent done --date 2026-02-22 --ids 1,3
+
+# 在系统浏览器打开原文（按当日ID）
+wechat-agent open --id 1
+wechat-agent open --date 2026-02-22 --id 3
 ```
 
 状态查看：
@@ -142,9 +156,10 @@ wa add -n "量子位" -i QbitAI
 wa list
 wa show -m source
 wa show -m recommend
+wa history --date 2026-02-22 -m source
 wa done -i 1,2,3
 wa todo -i 2
-wa open -i 12
+wa open -i 1
 wa config api
 wa config show
 wa remove -i QbitAI
@@ -169,9 +184,11 @@ wechat-agent view --mode source --interactive
 
 - 标题列是可点击链接（支持 OSC 8 的终端可直接点击打开原文）。
 - 标题点击使用原始完整链接（保留全部 query 参数，避免参数丢失）。
-- 若终端对外链有安全拦截，使用 `wechat-agent open --article-id <id>` 强制调用系统浏览器打开。
+- 若终端对外链有安全拦截，使用 `wechat-agent open --id <day_id> [--date YYYY-MM-DD]` 强制调用系统浏览器打开。
 - AI 摘要优先基于正文全文提取后总结；正文抓取失败时自动回退。
 - 摘要长度统一控制在 50 字以内，避免终端展示时出现过长粘连。
+- 用户可见 ID 为“每日ID”（每个日期从 1 开始），不再使用数据库全局ID。
+- `history` 命令只查本地库，不触发抓取；`view` 命令会触发增量同步。
 - 已移除 `--test-prev-day` 测试参数，日期归类统一由发布时刻规则自动处理。
 - 每次命令输出末尾都会显示当前 AI 引擎信息，例如：
   - `AI: provider=openai | summary=gpt-4o-mini | embedding=text-embedding-3-small`

@@ -51,11 +51,9 @@ def _title_cell(title: str, url: str) -> Text | str:
 
 def _add_item(table: Table, item: ArticleViewItem, include_source: bool, include_score: bool) -> None:
     summary = re.sub(r"\s+", " ", item.summary or "").strip()
-    if len(summary) > 50:
-        summary = f"{summary[:49].rstrip('，,、；;：:')}…"
 
     row = [
-        str(item.article_id),
+        str(item.day_id),
         _read_flag(item.is_read),
     ]
     if include_source:

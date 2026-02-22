@@ -33,6 +33,8 @@ class Settings:
     article_fetch_timeout_seconds: int
     summary_source_char_limit: int
     midnight_shift_days: int
+    sync_overlap_seconds: int
+    incremental_sync_enabled: bool
 
     def resolved_ai_provider(self) -> str:
         provider = self.ai_provider.strip().lower()
@@ -107,6 +109,17 @@ def _to_int(raw: str | None, default: int) -> int:
     return value
 
 
+def _to_bool(raw: str | None, default: bool) -> bool:
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def get_default_env_file() -> Path:
     custom_path = os.getenv("WECHAT_AGENT_ENV_FILE", "").strip()
     if custom_path:
@@ -147,4 +160,6 @@ def get_settings() -> Settings:
         article_fetch_timeout_seconds=_to_int(os.getenv("ARTICLE_FETCH_TIMEOUT_SECONDS"), 15),
         summary_source_char_limit=_to_int(os.getenv("SUMMARY_SOURCE_CHAR_LIMIT"), 6000),
         midnight_shift_days=_to_int(os.getenv("MIDNIGHT_SHIFT_DAYS"), 2),
+        sync_overlap_seconds=_to_int(os.getenv("SYNC_OVERLAP_SECONDS"), 120),
+        incremental_sync_enabled=_to_bool(os.getenv("INCREMENTAL_SYNC_ENABLED"), True),
     )
