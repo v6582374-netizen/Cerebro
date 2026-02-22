@@ -180,26 +180,26 @@ def _query_article_items(session, target_date: date, mode: str) -> list[ArticleV
     tag_re = re.compile(r"<[^>]+>")
 
     def normalize_with_title(title: str) -> str:
-        cleaned = re.sub(r"\s+", "", title.strip())
-        if len(cleaned) >= 30:
-            return cleaned[:50]
+        cleaned = tag_re.sub(" ", title or "")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
         if not cleaned:
-            cleaned = "文章信息较少"
-        suffix = "建议阅读全文了解细节"
-        while len(cleaned) < 30:
-            cleaned = f"{cleaned}{suffix}"
-        return cleaned[:50]
+            cleaned = "正文抓取失败，建议打开原文查看。"
+        if len(cleaned) > 50:
+            return f"{cleaned[:49].rstrip('，,、；;：:')}…"
+        return cleaned
 
     def clean_summary(raw: str | None, title: str) -> str:
         if not raw:
             return normalize_with_title(title)
         no_tag = tag_re.sub(" ", raw)
-        no_space = re.sub(r"\s+", " ", no_tag).strip()
-        if not no_space:
+        compact = re.sub(r"\s+", " ", no_tag).strip()
+        compact = re.sub(r'^[\"\'“”‘’]+|[\"\'“”‘’]+$', "", compact).strip()
+        compact = re.sub(r"^(摘要|总结|内容摘要|摘要如下)\s*[:：]\s*", "", compact).strip()
+        if not compact:
             return normalize_with_title(title)
-        if "<" in no_space or len(no_space) < 10:
-            return normalize_with_title(title)
-        return no_space[:50]
+        if len(compact) > 50:
+            return f"{compact[:49].rstrip('，,、；;：:')}…"
+        return compact
 
     rows = session.execute(stmt).all()
     items = [

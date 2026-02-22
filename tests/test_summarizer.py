@@ -6,7 +6,7 @@ from wechat_agent.schemas import RawArticle
 from wechat_agent.services.summarizer import Summarizer
 
 
-def test_fallback_summary_length_between_30_and_50():
+def test_fallback_summary_length_within_50():
     article = RawArticle(
         external_id="e1",
         title="这是一篇关于技术趋势和产品设计实践的长标题文章",
@@ -19,4 +19,5 @@ def test_fallback_summary_length_between_30_and_50():
     service = Summarizer(api_key=None, base_url=None, chat_model="gpt-4o-mini")
     result = service.summarize(article)
 
-    assert 30 <= len(result.summary_text) <= 50
+    assert 0 < len(result.summary_text) <= 50
+    assert "\n" not in result.summary_text

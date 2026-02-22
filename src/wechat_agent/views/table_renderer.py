@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 from io import StringIO
+import re
 
 from rich import box
 from rich.console import Console
@@ -25,17 +26,17 @@ def _build_table(include_source: bool, include_score: bool) -> Table:
     table = Table(
         show_header=True,
         header_style="bold cyan",
-        box=box.SIMPLE_HEAVY,
-        show_lines=False,
+        box=box.SQUARE,
+        show_lines=True,
         pad_edge=True,
     )
-    table.add_column("ID", justify="right", width=6)
-    table.add_column("已读", width=6)
+    table.add_column("ID", justify="right", width=4, no_wrap=True)
+    table.add_column("已读", width=5, no_wrap=True)
     if include_source:
-        table.add_column("公众号", width=18, overflow="fold")
-    table.add_column("更新时间", width=18)
-    table.add_column("标题(可点击)", min_width=24, overflow="fold")
-    table.add_column("AI摘要", min_width=24, overflow="fold")
+        table.add_column("公众号", width=12, overflow="fold")
+    table.add_column("更新时间", width=16, no_wrap=True)
+    table.add_column("标题(可点击)", ratio=3, overflow="fold")
+    table.add_column("AI摘要", ratio=4, overflow="fold")
     if include_score:
         table.add_column("推荐分", justify="right", width=8)
     return table
@@ -49,6 +50,10 @@ def _title_cell(title: str, url: str) -> Text | str:
 
 
 def _add_item(table: Table, item: ArticleViewItem, include_source: bool, include_score: bool) -> None:
+    summary = re.sub(r"\s+", " ", item.summary or "").strip()
+    if len(summary) > 50:
+        summary = f"{summary[:49].rstrip('，,、；;：:')}…"
+
     row = [
         str(item.article_id),
         _read_flag(item.is_read),
@@ -59,7 +64,7 @@ def _add_item(table: Table, item: ArticleViewItem, include_source: bool, include
         [
             _format_time(item.published_at),
             _title_cell(item.title, item.url),
-            item.summary,
+            summary,
         ]
     )
     if include_score:
