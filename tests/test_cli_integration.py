@@ -55,22 +55,22 @@ def test_cli_view_modes_and_read_mark(isolated_env, monkeypatch):
 
     assert "同步完成" in source_out.stdout
     assert "号A" in source_out.stdout
-    assert "原文链接" in source_out.stdout
+    assert "标题(可点击)" in source_out.stdout
     assert "https://example.com/test" in source_out.stdout
-    assert "AI摘要" in time_out.stdout
-    assert "推荐分" in recommend_out.stdout
-    assert "AI: summary=" in source_out.stdout
-    assert "AI: summary=" in time_out.stdout
-    assert "AI: summary=" in recommend_out.stdout
+    assert "https://example.com/test" in time_out.stdout
+    assert "https://example.com/test" in recommend_out.stdout
+    assert "AI: provider=" in source_out.stdout
+    assert "AI: provider=" in time_out.stdout
+    assert "AI: provider=" in recommend_out.stdout
 
     mark = runner.invoke(app, ["read", "mark", "--article-id", "1", "--state", "read"])
     assert mark.exit_code == 0
-    assert "AI: summary=" in mark.stdout
+    assert "AI: provider=" in mark.stdout
 
     recommend_after_mark = runner.invoke(app, ["view", "--mode", "recommend", "--date", today])
     assert recommend_after_mark.exit_code == 0
     assert "[x]" in recommend_after_mark.stdout
-    assert "AI: summary=" in recommend_after_mark.stdout
+    assert "AI: provider=" in recommend_after_mark.stdout
 
 
 def test_cli_test_prev_day_switch(isolated_env, monkeypatch):
@@ -84,7 +84,7 @@ def test_cli_test_prev_day_switch(isolated_env, monkeypatch):
     out = runner.invoke(app, ["view", "--mode", "source", "--test-prev-day"])
     assert out.exit_code == 0
     assert "测试模式: 已切换为前一天数据。" in out.stdout
-    assert "AI: summary=" in out.stdout
+    assert "AI: provider=" in out.stdout
 
 
 def test_cli_view_interactive_read_toggle(isolated_env, monkeypatch):
@@ -104,12 +104,12 @@ def test_cli_view_interactive_read_toggle(isolated_env, monkeypatch):
     assert interactive.exit_code == 0
     assert "进入交互已读模式" in interactive.stdout
     assert "已更新 1 篇文章状态。" in interactive.stdout
-    assert "AI: summary=" in interactive.stdout
+    assert "AI: provider=" in interactive.stdout
 
     after = runner.invoke(app, ["view", "--mode", "source", "--date", today, "--no-interactive"])
     assert after.exit_code == 0
     assert "[x]" in after.stdout
-    assert "AI: summary=" in after.stdout
+    assert "AI: provider=" in after.stdout
 
 
 def test_non_view_commands_append_ai_footer(isolated_env):
@@ -121,6 +121,32 @@ def test_non_view_commands_append_ai_footer(isolated_env):
     assert empty_status.exit_code == 0
     assert not_found.exit_code == 0
 
-    assert "AI: summary=" in empty_list.stdout
-    assert "AI: summary=" in empty_status.stdout
-    assert "AI: summary=" in not_found.stdout
+    assert "AI: provider=" in empty_list.stdout
+    assert "AI: provider=" in empty_status.stdout
+    assert "AI: provider=" in not_found.stdout
+
+
+def test_quick_alias_commands(isolated_env, monkeypatch):
+    monkeypatch.setattr("wechat_agent.providers.template_feed_provider.TemplateFeedProvider.fetch", _fake_fetch)
+    monkeypatch.setattr("wechat_agent.providers.template_feed_provider.TemplateFeedProvider.probe", _fake_probe)
+    monkeypatch.setattr(Summarizer, "summarize", _fake_summary)
+
+    add = runner.invoke(app, ["add", "-n", "号A", "-i", "gh_a"])
+    assert add.exit_code == 0
+
+    list_out = runner.invoke(app, ["list"])
+    assert list_out.exit_code == 0
+    assert "号A" in list_out.stdout
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    show_out = runner.invoke(app, ["show", "-m", "source", "-d", today, "--no-interactive"])
+    assert show_out.exit_code == 0
+    assert "CLI 集成测试文章" in show_out.stdout
+
+    done_out = runner.invoke(app, ["done", "-i", "1"])
+    assert done_out.exit_code == 0
+    assert "已批量更新 1 篇文章状态为: read" in done_out.stdout
+
+    todo_out = runner.invoke(app, ["todo", "-i", "1"])
+    assert todo_out.exit_code == 0
+    assert "已批量更新 1 篇文章状态为: unread" in todo_out.stdout

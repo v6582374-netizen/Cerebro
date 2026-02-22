@@ -7,6 +7,7 @@ from io import StringIO
 from rich import box
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from ..schemas import ArticleViewItem
 
@@ -33,12 +34,17 @@ def _build_table(include_source: bool, include_score: bool) -> Table:
     if include_source:
         table.add_column("公众号", width=18, overflow="fold")
     table.add_column("更新时间", width=18)
-    table.add_column("标题", min_width=24, overflow="fold")
-    table.add_column("原文链接", min_width=28, overflow="fold")
+    table.add_column("标题(可点击)", min_width=24, overflow="fold")
     table.add_column("AI摘要", min_width=24, overflow="fold")
     if include_score:
         table.add_column("推荐分", justify="right", width=8)
     return table
+
+
+def _title_cell(title: str, url: str) -> Text | str:
+    if not url:
+        return title
+    return Text(title, style=f"link {url}")
 
 
 def _add_item(table: Table, item: ArticleViewItem, include_source: bool, include_score: bool) -> None:
@@ -51,8 +57,7 @@ def _add_item(table: Table, item: ArticleViewItem, include_source: bool, include
     row.extend(
         [
             _format_time(item.published_at),
-            item.title,
-            item.url,
+            _title_cell(item.title, item.url),
             item.summary,
         ]
     )
@@ -64,7 +69,7 @@ def _add_item(table: Table, item: ArticleViewItem, include_source: bool, include
 def render_article_items(items: list[ArticleViewItem], mode: str) -> str:
     console = Console(
         record=True,
-        force_terminal=False,
+        force_terminal=True,
         color_system=None,
         width=180,
         markup=False,
@@ -88,11 +93,11 @@ def render_article_items(items: list[ArticleViewItem], mode: str) -> str:
             for item in grouped[source_name]:
                 _add_item(table, item, include_source=False, include_score=False)
             console.print(table)
-        return console.export_text()
+        return console.export_text(styles=True)
 
     include_score = mode == "recommend"
     table = _build_table(include_source=True, include_score=include_score)
     for item in items:
         _add_item(table, item, include_source=True, include_score=include_score)
     console.print(table)
-    return console.export_text()
+    return console.export_text(styles=True)

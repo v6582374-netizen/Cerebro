@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -49,6 +50,7 @@ class SyncService:
         for sub in subscriptions:
             self._sync_subscription(session=session, run=run, sub=sub, since=day_start)
 
+        self._refresh_low_quality_summaries(session=session, target_date=target_date)
         self.recommender.recompute_scores_for_date(session=session, target_date=target_date)
 
         run.finished_at = utcnow()
@@ -152,3 +154,50 @@ class SyncService:
             text=embedding_text,
         )
         return True
+
+    def _refresh_low_quality_summaries(self, session: Session, target_date: date) -> None:
+        day_start, day_end = local_day_bounds_utc(target_date)
+        stmt = (
+            select(Article, ArticleSummary)
+            .outerjoin(ArticleSummary, ArticleSummary.article_id == Article.id)
+            .where(and_(Article.published_at >= day_start, Article.published_at < day_end))
+        )
+
+        for article, summary in session.execute(stmt).all():
+            if summary is not None and not self._needs_refresh(summary.summary_text):
+                continue
+
+            raw = RawArticle(
+                external_id=article.external_id,
+                title=article.title,
+                url=article.url,
+                published_at=article.published_at,
+                content_excerpt=article.content_excerpt or "",
+                raw_hash=article.raw_hash or article.external_id,
+            )
+            refreshed = self.summarizer.summarize(raw)
+
+            if summary is None:
+                session.add(
+                    ArticleSummary(
+                        article_id=article.id,
+                        summary_text=refreshed.summary_text,
+                        model=refreshed.model,
+                    )
+                )
+            else:
+                summary.summary_text = refreshed.summary_text
+                summary.model = refreshed.model
+
+    def _needs_refresh(self, summary_text: str) -> bool:
+        compact = re.sub(r"\s+", "", summary_text or "")
+        if len(compact) < 24:
+            return True
+        if "<" in summary_text or ">" in summary_text:
+            return True
+        if re.search(r"\d{4}-\d{2}-\d{2}", summary_text) and len(compact) < 40:
+            return True
+        metadata_tokens = ("关注前沿科技", "原创", "发布于", "发表于")
+        if any(token in summary_text for token in metadata_tokens):
+            return True
+        return False

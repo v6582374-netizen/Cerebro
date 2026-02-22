@@ -44,11 +44,11 @@ class Recommender:
         self,
         api_key: str | None,
         base_url: str | None,
-        embed_model: str,
+        embed_model: str | None,
         client: OpenAI | None = None,
         vector_size: int = 64,
     ) -> None:
-        self.embed_model = embed_model
+        self.embed_model = (embed_model or "").strip()
         self.vector_size = vector_size
         if client is not None:
             self.client = client
@@ -56,9 +56,10 @@ class Recommender:
             self.client = OpenAI(api_key=api_key, base_url=base_url)
         else:
             self.client = None
+        self.remote_embedding_enabled = self.client is not None and bool(self.embed_model)
 
     def embed_text(self, text: str) -> list[float]:
-        if self.client is not None:
+        if self.remote_embedding_enabled:
             try:
                 response = self.client.embeddings.create(model=self.embed_model, input=text)
                 embedding = response.data[0].embedding
@@ -82,7 +83,7 @@ class Recommender:
             ArticleEmbedding(
                 article_id=article_id,
                 vector_json=json.dumps(vector),
-                model=self.embed_model if self.client is not None else "local-hash",
+                model=self.embed_model if self.remote_embedding_enabled else "local-hash",
             )
         )
         session.flush()

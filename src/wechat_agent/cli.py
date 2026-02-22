@@ -75,16 +75,23 @@ def _build_runtime():
         provider=provider,
         wechat2rss_index_url=settings.wechat2rss_index_url,
     )
+    api_key = settings.resolved_api_key()
+    base_url = settings.resolved_base_url()
+    chat_model = settings.resolved_chat_model()
+    embed_model = settings.resolved_embed_model()
+
     fetcher = Fetcher(provider=provider)
     summarizer = Summarizer(
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url,
-        chat_model=settings.openai_chat_model,
+        api_key=api_key,
+        base_url=base_url,
+        chat_model=chat_model,
+        fetch_timeout_seconds=settings.article_fetch_timeout_seconds,
+        source_char_limit=settings.summary_source_char_limit,
     )
     recommender = Recommender(
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url,
-        embed_model=settings.openai_embed_model,
+        api_key=api_key,
+        base_url=base_url,
+        embed_model=embed_model,
     )
     sync_service = SyncService(
         resolver=resolver,
@@ -96,13 +103,13 @@ def _build_runtime():
 
 
 def _ai_footer(settings) -> str:
-    if settings.openai_api_key:
-        summary_model = settings.openai_chat_model
-        embed_model = settings.openai_embed_model
+    provider = settings.resolved_ai_provider()
+    if provider in {"openai", "deepseek"}:
+        summary_model = settings.resolved_chat_model()
+        embed_model = settings.resolved_embed_model() or "local-hash"
+        return f"AI: provider={provider} | summary={summary_model} | embedding={embed_model}"
     else:
-        summary_model = "fallback(no_api_key)"
-        embed_model = "local-hash(no_api_key)"
-    return f"AI: summary={summary_model} | embedding={embed_model}"
+        return "AI: provider=none | summary=fallback(no_api_key) | embedding=local-hash(no_api_key)"
 
 
 def _echo_ai_footer(settings) -> None:
@@ -240,6 +247,34 @@ def _parse_id_list(raw_ids: str) -> list[int]:
     if not result:
         raise ValueError("缺少文章ID")
     return result
+
+
+def _bulk_mark_read(ids_raw: str, is_read: bool) -> None:
+    settings = get_settings()
+    init_db(settings)
+    service = ReadStateService()
+
+    try:
+        ids = _parse_id_list(ids_raw)
+    except ValueError as exc:
+        typer.echo(str(exc))
+        _echo_ai_footer(settings)
+        return
+
+    changed = 0
+    with session_scope(settings) as session:
+        for article_id in ids:
+            article = session.get(Article, article_id)
+            if article is None:
+                typer.echo(f"文章不存在: {article_id}")
+                continue
+            service.mark(session=session, article_id=article_id, is_read=is_read)
+            changed += 1
+        if changed > 0:
+            session.commit()
+
+    typer.echo(f"已批量更新 {changed} 篇文章状态为: {'read' if is_read else 'unread'}")
+    _echo_ai_footer(settings)
 
 
 def _interactive_read_loop(
@@ -512,6 +547,77 @@ def read_mark(
         session.commit()
         typer.echo(f"已更新文章 {article_id} 状态为: {'read' if is_read else 'unread'}")
     _echo_ai_footer(settings)
+
+
+@app.command("add")
+def quick_add(
+    name: str = typer.Option(..., "--name", "-n"),
+    wechat_id: str = typer.Option(..., "--id", "-i"),
+) -> None:
+    """快捷命令：新增订阅。"""
+
+    sub_add(name=name, wechat_id=wechat_id)
+
+
+@app.command("list")
+def quick_list() -> None:
+    """快捷命令：列出订阅。"""
+
+    sub_list()
+
+
+@app.command("remove")
+def quick_remove(
+    wechat_id: str = typer.Option(..., "--id", "-i"),
+) -> None:
+    """快捷命令：删除订阅。"""
+
+    sub_remove(wechat_id=wechat_id)
+
+
+@app.command("source")
+def quick_source(
+    wechat_id: str = typer.Option(..., "--id", "-i"),
+    url: str = typer.Option(..., "--url"),
+) -> None:
+    """快捷命令：手动设置订阅源。"""
+
+    sub_set_source(wechat_id=wechat_id, url=url)
+
+
+@app.command("show")
+def quick_show(
+    mode: ViewMode | None = typer.Option(None, "--mode", "-m"),
+    date_text: str | None = typer.Option(None, "--date", "-d"),
+    interactive: bool | None = typer.Option(None, "--interactive/--no-interactive"),
+    test_prev_day: bool = typer.Option(False, "--test-prev-day"),
+) -> None:
+    """快捷命令：查看文章（会先同步）。"""
+
+    view(
+        mode=mode,
+        date_text=date_text,
+        interactive=interactive,
+        test_prev_day=test_prev_day,
+    )
+
+
+@app.command("done")
+def quick_done(
+    ids: str = typer.Option(..., "--ids", "-i", help="逗号分隔，如 1,2,3"),
+) -> None:
+    """快捷命令：批量标记已读。"""
+
+    _bulk_mark_read(ids_raw=ids, is_read=True)
+
+
+@app.command("todo")
+def quick_todo(
+    ids: str = typer.Option(..., "--ids", "-i", help="逗号分隔，如 1,2,3"),
+) -> None:
+    """快捷命令：批量标记未读。"""
+
+    _bulk_mark_read(ids_raw=ids, is_read=False)
 
 
 def main() -> None:
