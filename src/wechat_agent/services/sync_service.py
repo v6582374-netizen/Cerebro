@@ -174,7 +174,7 @@ class SyncService:
         )
 
         for article, summary in session.execute(stmt).all():
-            if summary is not None and not self._needs_refresh(summary.summary_text):
+            if summary is not None and not self._needs_refresh(summary.summary_text, summary.model):
                 continue
 
             raw = RawArticle(
@@ -199,7 +199,7 @@ class SyncService:
                 summary.summary_text = refreshed.summary_text
                 summary.model = refreshed.model
 
-    def _needs_refresh(self, summary_text: str) -> bool:
+    def _needs_refresh(self, summary_text: str, model: str | None = None) -> bool:
         compact = re.sub(r"\s+", "", summary_text or "")
         if len(compact) < 24:
             return True
@@ -210,4 +210,10 @@ class SyncService:
         metadata_tokens = ("关注前沿科技", "原创", "发布于", "发表于")
         if any(token in summary_text for token in metadata_tokens):
             return True
+        if compact.endswith(("…", "...", "..", "，", ",", "、", "；", ";", "：", ":")):
+            return True
+        # Fallback summaries are often direct snippets; near-limit snippet tails are likely truncated.
+        if (model or "").strip().lower() == "fallback":
+            if len(compact) >= 48 and compact[-1] not in {"。", "！", "？", "!", "?"}:
+                return True
         return False
