@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timezone
-from io import StringIO
 import re
 
 from rich import box
@@ -29,6 +28,7 @@ def _build_table(include_source: bool, include_score: bool) -> Table:
         box=box.SQUARE,
         show_lines=True,
         pad_edge=True,
+        expand=True,
     )
     table.add_column("ID", justify="right", width=4, no_wrap=True)
     table.add_column("已读", width=5, no_wrap=True)
@@ -74,36 +74,30 @@ def _add_item(table: Table, item: ArticleViewItem, include_source: bool, include
 
 def render_article_items(items: list[ArticleViewItem], mode: str) -> str:
     console = Console(
-        record=True,
         force_terminal=True,
-        color_system=None,
-        width=180,
+        color_system="standard",
         markup=False,
-        file=StringIO(),
     )
+    with console.capture() as capture:
+        if not items:
+            console.print("当天没有可展示的文章。")
+        elif mode == "source":
+            grouped: dict[str, list[ArticleViewItem]] = defaultdict(list)
+            for item in items:
+                grouped[item.source_name].append(item)
 
-    if not items:
-        console.print("当天没有可展示的文章。")
-        return console.export_text()
-
-    if mode == "source":
-        grouped: dict[str, list[ArticleViewItem]] = defaultdict(list)
-        for item in items:
-            grouped[item.source_name].append(item)
-
-        for index, source_name in enumerate(sorted(grouped.keys())):
-            if index > 0:
-                console.print()
-            console.print(source_name)
-            table = _build_table(include_source=False, include_score=False)
-            for item in grouped[source_name]:
-                _add_item(table, item, include_source=False, include_score=False)
+            for index, source_name in enumerate(sorted(grouped.keys())):
+                if index > 0:
+                    console.print()
+                console.print(source_name)
+                table = _build_table(include_source=False, include_score=False)
+                for item in grouped[source_name]:
+                    _add_item(table, item, include_source=False, include_score=False)
+                console.print(table)
+        else:
+            include_score = mode == "recommend"
+            table = _build_table(include_source=True, include_score=include_score)
+            for item in items:
+                _add_item(table, item, include_source=True, include_score=include_score)
             console.print(table)
-        return console.export_text(styles=True)
-
-    include_score = mode == "recommend"
-    table = _build_table(include_source=True, include_score=include_score)
-    for item in items:
-        _add_item(table, item, include_source=True, include_score=include_score)
-    console.print(table)
-    return console.export_text(styles=True)
+    return capture.get()

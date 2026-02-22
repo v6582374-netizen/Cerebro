@@ -179,14 +179,22 @@ def _query_article_items(session, target_date: date, mode: str) -> list[ArticleV
 
     tag_re = re.compile(r"<[^>]+>")
 
+    def truncate_summary(text: str, limit: int = 50) -> str:
+        if len(text) <= limit:
+            return text
+        for sep in ("。", "！", "？", ".", "!", "?", "；", ";", "，", ",", "、"):
+            idx = text.rfind(sep, 0, limit + 1)
+            if idx >= int(limit * 0.6):
+                return text[: idx + 1].strip()
+        clipped = text[: max(limit - 1, 1)].rstrip("，,、；;：:")
+        return f"{clipped}…"
+
     def normalize_with_title(title: str) -> str:
         cleaned = tag_re.sub(" ", title or "")
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         if not cleaned:
             cleaned = "正文抓取失败，建议打开原文查看。"
-        if len(cleaned) > 50:
-            return f"{cleaned[:49].rstrip('，,、；;：:')}…"
-        return cleaned
+        return truncate_summary(cleaned, 50)
 
     def clean_summary(raw: str | None, title: str) -> str:
         if not raw:
@@ -197,9 +205,7 @@ def _query_article_items(session, target_date: date, mode: str) -> list[ArticleV
         compact = re.sub(r"^(摘要|总结|内容摘要|摘要如下)\s*[:：]\s*", "", compact).strip()
         if not compact:
             return normalize_with_title(title)
-        if len(compact) > 50:
-            return f"{compact[:49].rstrip('，,、；;：:')}…"
-        return compact
+        return truncate_summary(compact, 50)
 
     rows = session.execute(stmt).all()
     items = [

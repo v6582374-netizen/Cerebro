@@ -7,14 +7,14 @@
 面向最终用户，直接用包管理器全局安装即可，在任意目录都能执行 `wechat-agent`。
 
 ```bash
-# 推荐
-pipx install wechat-agent
+# 推荐：从 GitHub 安装最新版本
+pipx install "git+https://github.com/v6582374-netizen/Cerebro.git"
 
 # 或
-uv tool install wechat-agent
+uv tool install "git+https://github.com/v6582374-netizen/Cerebro.git"
 
-# 或
-python -m pip install --user wechat-agent
+# 本地开发源码全局可用（可实时反映代码修改）
+uv tool install -e /Users/shiwen/Desktop/Wechat_agent
 ```
 
 升级 / 卸载：
@@ -22,6 +22,14 @@ python -m pip install --user wechat-agent
 ```bash
 pipx upgrade wechat-agent
 pipx uninstall wechat-agent
+```
+
+如果出现 `zsh: command not found: wechat-agent`：
+
+```bash
+uv tool update-shell
+exec zsh
+which wechat-agent
 ```
 
 ## 2) 开发者模式（仅本地调试）
