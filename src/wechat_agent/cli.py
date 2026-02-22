@@ -1,0 +1,522 @@
+from __future__ import annotations
+
+from collections import defaultdict, deque
+from datetime import date, datetime, timedelta
+from enum import Enum
+import re
+import sys
+
+import typer
+from rich.console import Console
+from rich.table import Table
+from sqlalchemy import and_, case, func, select
+
+from .config import get_settings
+from .db import init_db, session_scope
+from .models import (
+    Article,
+    ArticleSummary,
+    ReadState,
+    RecommendationScoreEntry,
+    SOURCE_STATUS_ACTIVE,
+    SOURCE_STATUS_PENDING,
+    Subscription,
+    SYNC_ITEM_STATUS_FAILED,
+    SyncRun,
+    SyncRunItem,
+)
+from .providers.template_feed_provider import TemplateFeedProvider
+from .schemas import ArticleViewItem
+from .services.fetcher import Fetcher
+from .services.read_state import ReadStateService
+from .services.recommender import Recommender
+from .services.source_resolver import SourceResolver
+from .services.summarizer import Summarizer
+from .services.sync_service import SyncService
+from .time_utils import local_day_bounds_utc
+from .views.table_renderer import render_article_items
+
+app = typer.Typer(help="微信公众号文章 CLI 聚合推荐系统", no_args_is_help=True)
+sub_app = typer.Typer(help="订阅管理")
+read_app = typer.Typer(help="阅读状态管理")
+app.add_typer(sub_app, name="sub")
+app.add_typer(read_app, name="read")
+
+
+class ViewMode(str, Enum):
+    source = "source"
+    time = "time"
+    recommend = "recommend"
+
+
+class ReadStateValue(str, Enum):
+    read = "read"
+    unread = "unread"
+
+
+def _parse_date(raw: str | None) -> date:
+    if not raw:
+        return datetime.now().date()
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise typer.BadParameter("日期格式必须是 YYYY-MM-DD") from exc
+
+
+def _day_bounds(target_date: date) -> tuple[datetime, datetime]:
+    return local_day_bounds_utc(target_date)
+
+
+def _build_runtime():
+    settings = get_settings()
+    provider = TemplateFeedProvider(timeout_seconds=settings.http_timeout_seconds)
+    resolver = SourceResolver(
+        templates=settings.source_templates,
+        provider=provider,
+        wechat2rss_index_url=settings.wechat2rss_index_url,
+    )
+    fetcher = Fetcher(provider=provider)
+    summarizer = Summarizer(
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url,
+        chat_model=settings.openai_chat_model,
+    )
+    recommender = Recommender(
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url,
+        embed_model=settings.openai_embed_model,
+    )
+    sync_service = SyncService(
+        resolver=resolver,
+        fetcher=fetcher,
+        summarizer=summarizer,
+        recommender=recommender,
+    )
+    return provider, sync_service
+
+
+def _ai_footer(settings) -> str:
+    if settings.openai_api_key:
+        summary_model = settings.openai_chat_model
+        embed_model = settings.openai_embed_model
+    else:
+        summary_model = "fallback(no_api_key)"
+        embed_model = "local-hash(no_api_key)"
+    return f"AI: summary={summary_model} | embedding={embed_model}"
+
+
+def _echo_ai_footer(settings) -> None:
+    typer.echo(_ai_footer(settings))
+
+
+def _round_robin_by_source(items: list[ArticleViewItem]) -> list[ArticleViewItem]:
+    buckets: dict[str, deque[ArticleViewItem]] = defaultdict(deque)
+    for item in items:
+        buckets[item.source_name].append(item)
+
+    result: list[ArticleViewItem] = []
+    source_names = sorted(buckets.keys())
+    while True:
+        progress = False
+        for source_name in source_names:
+            bucket = buckets[source_name]
+            if not bucket:
+                continue
+            result.append(bucket.popleft())
+            progress = True
+        if not progress:
+            break
+    return result
+
+
+def _query_article_items(session, target_date: date, mode: str) -> list[ArticleViewItem]:
+    day_start, day_end = _day_bounds(target_date)
+
+    stmt = (
+        select(
+            Article.id,
+            Subscription.name,
+            Article.published_at,
+            Article.title,
+            Article.url,
+            ArticleSummary.summary_text,
+            ReadState.is_read,
+            RecommendationScoreEntry.score,
+        )
+        .join(Subscription, Subscription.id == Article.subscription_id)
+        .outerjoin(ArticleSummary, ArticleSummary.article_id == Article.id)
+        .outerjoin(ReadState, ReadState.article_id == Article.id)
+        .outerjoin(RecommendationScoreEntry, RecommendationScoreEntry.article_id == Article.id)
+        .where(and_(Article.published_at >= day_start, Article.published_at < day_end))
+    )
+
+    if mode == "source":
+        stmt = stmt.order_by(Subscription.name.asc(), Article.published_at.desc())
+    elif mode == "time":
+        stmt = stmt.order_by(Article.published_at.desc())
+    else:
+        read_rank = case((ReadState.is_read.is_(True), 1), else_=0)
+        stmt = stmt.order_by(read_rank.asc(), RecommendationScoreEntry.score.desc().nullslast(), Article.published_at.desc())
+
+    tag_re = re.compile(r"<[^>]+>")
+
+    def normalize_with_title(title: str) -> str:
+        cleaned = re.sub(r"\s+", "", title.strip())
+        if len(cleaned) >= 30:
+            return cleaned[:50]
+        if not cleaned:
+            cleaned = "文章信息较少"
+        suffix = "建议阅读全文了解细节"
+        while len(cleaned) < 30:
+            cleaned = f"{cleaned}{suffix}"
+        return cleaned[:50]
+
+    def clean_summary(raw: str | None, title: str) -> str:
+        if not raw:
+            return normalize_with_title(title)
+        no_tag = tag_re.sub(" ", raw)
+        no_space = re.sub(r"\s+", " ", no_tag).strip()
+        if not no_space:
+            return normalize_with_title(title)
+        if "<" in no_space or len(no_space) < 10:
+            return normalize_with_title(title)
+        return no_space[:50]
+
+    rows = session.execute(stmt).all()
+    items = [
+        ArticleViewItem(
+            article_id=row[0],
+            source_name=row[1],
+            published_at=row[2],
+            title=row[3],
+            url=row[4] or "-",
+            summary=clean_summary(row[5], row[3]),
+            is_read=bool(row[6]) if row[6] is not None else False,
+            score=float(row[7]) if row[7] is not None else None,
+        )
+        for row in rows
+    ]
+
+    if mode == "recommend":
+        read_count = session.scalar(select(func.count()).select_from(ReadState).where(ReadState.is_read.is_(True))) or 0
+        if read_count == 0:
+            items = sorted(items, key=lambda x: x.published_at, reverse=True)
+            items = _round_robin_by_source(items)
+
+    return items
+
+
+def _render_subscription_table(subscriptions: list[Subscription]) -> str:
+    console = Console(record=True, force_terminal=False, color_system=None, width=140)
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("公众号")
+    table.add_column("微信号")
+    table.add_column("状态")
+    table.add_column("源URL")
+    table.add_column("错误信息")
+
+    for sub in subscriptions:
+        table.add_row(
+            sub.name,
+            sub.wechat_id,
+            sub.source_status,
+            sub.source_url or "-",
+            sub.last_error or "-",
+        )
+
+    console.print(table)
+    return console.export_text()
+
+
+def _parse_id_list(raw_ids: str) -> list[int]:
+    result: list[int] = []
+    for part in raw_ids.split(","):
+        candidate = part.strip()
+        if not candidate:
+            continue
+        if not candidate.isdigit():
+            raise ValueError(f"非法文章ID: {candidate}")
+        result.append(int(candidate))
+    if not result:
+        raise ValueError("缺少文章ID")
+    return result
+
+
+def _interactive_read_loop(
+    session,
+    target_date: date,
+    mode_value: str,
+) -> None:
+    service = ReadStateService()
+
+    typer.echo("进入交互已读模式: r <ids> 标已读 | u <ids> 标未读 | t <ids> 切换 | p 重绘 | q 退出")
+    while True:
+        try:
+            raw = typer.prompt("read>").strip()
+        except (EOFError, typer.Abort):
+            typer.echo("退出交互已读模式。")
+            return
+
+        if not raw:
+            continue
+        if raw.lower() in {"q", "quit", "exit"}:
+            typer.echo("退出交互已读模式。")
+            return
+        if raw.lower() in {"p", "print"}:
+            items = _query_article_items(session=session, target_date=target_date, mode=mode_value)
+            typer.echo(render_article_items(items=items, mode=mode_value), nl=False)
+            continue
+
+        pieces = raw.split(maxsplit=1)
+        if len(pieces) != 2:
+            typer.echo("用法: r <ids> | u <ids> | t <ids> | p | q")
+            continue
+
+        op, payload = pieces[0].lower(), pieces[1]
+        if op not in {"r", "u", "t"}:
+            typer.echo("未知操作，只支持 r/u/t/p/q")
+            continue
+
+        try:
+            ids = _parse_id_list(payload)
+        except ValueError as exc:
+            typer.echo(str(exc))
+            continue
+
+        changed = 0
+        for article_id in ids:
+            article = session.get(Article, article_id)
+            if article is None:
+                typer.echo(f"文章不存在: {article_id}")
+                continue
+
+            if op == "r":
+                is_read = True
+            elif op == "u":
+                is_read = False
+            else:
+                existing = session.get(ReadState, article_id)
+                is_read = not (existing.is_read if existing else False)
+
+            service.mark(session=session, article_id=article_id, is_read=is_read)
+            changed += 1
+
+        if changed == 0:
+            continue
+
+        session.commit()
+        items = _query_article_items(session=session, target_date=target_date, mode=mode_value)
+        typer.echo(f"已更新 {changed} 篇文章状态。")
+        typer.echo(render_article_items(items=items, mode=mode_value), nl=False)
+
+
+@app.command("status")
+def status() -> None:
+    """查看最近一次同步结果。"""
+
+    settings = get_settings()
+    init_db(settings)
+
+    with session_scope(settings) as session:
+        run = session.scalar(select(SyncRun).order_by(SyncRun.started_at.desc()).limit(1))
+        if run is None:
+            typer.echo("暂无同步记录。")
+            _echo_ai_footer(settings)
+            return
+
+        typer.echo(
+            f"最近同步 #{run.id} | 触发方式: {run.trigger} | 成功: {run.success_count} | 失败: {run.fail_count}"
+        )
+
+        failed_items = session.execute(
+            select(Subscription.name, SyncRunItem.error_message)
+            .join(Subscription, Subscription.id == SyncRunItem.subscription_id)
+            .where(
+                SyncRunItem.sync_run_id == run.id,
+                SyncRunItem.status == SYNC_ITEM_STATUS_FAILED,
+            )
+        ).all()
+
+        if failed_items:
+            typer.echo("失败项:")
+            for name, error_message in failed_items:
+                typer.echo(f"- {name}: {error_message or '未知错误'}")
+    _echo_ai_footer(settings)
+
+
+@sub_app.command("add")
+def sub_add(name: str = typer.Option(..., "--name"), wechat_id: str = typer.Option(..., "--wechat-id")) -> None:
+    """新增订阅。"""
+
+    settings = get_settings()
+    init_db(settings)
+
+    with session_scope(settings) as session:
+        existing = session.scalar(select(Subscription).where(Subscription.wechat_id == wechat_id))
+        if existing:
+            typer.echo(f"已存在订阅: {wechat_id}")
+            _echo_ai_footer(settings)
+            return
+
+        session.add(
+            Subscription(
+                name=name,
+                wechat_id=wechat_id,
+                source_status=SOURCE_STATUS_PENDING,
+            )
+        )
+        session.commit()
+        typer.echo(f"已新增订阅: {name} ({wechat_id})")
+    _echo_ai_footer(settings)
+
+
+@sub_app.command("list")
+def sub_list() -> None:
+    """查看订阅列表。"""
+
+    settings = get_settings()
+    init_db(settings)
+
+    with session_scope(settings) as session:
+        rows = session.scalars(select(Subscription).order_by(Subscription.created_at.asc())).all()
+        if not rows:
+            typer.echo("当前没有订阅。")
+            _echo_ai_footer(settings)
+            return
+
+        rendered = _render_subscription_table(rows)
+        typer.echo(rendered, nl=False)
+    _echo_ai_footer(settings)
+
+
+@sub_app.command("remove")
+def sub_remove(wechat_id: str = typer.Option(..., "--wechat-id")) -> None:
+    """删除订阅。"""
+
+    settings = get_settings()
+    init_db(settings)
+
+    with session_scope(settings) as session:
+        sub = session.scalar(select(Subscription).where(Subscription.wechat_id == wechat_id))
+        if sub is None:
+            typer.echo(f"未找到订阅: {wechat_id}")
+            _echo_ai_footer(settings)
+            return
+
+        session.delete(sub)
+        session.commit()
+        typer.echo(f"已删除订阅: {wechat_id}")
+    _echo_ai_footer(settings)
+
+
+@sub_app.command("set-source")
+def sub_set_source(
+    wechat_id: str = typer.Option(..., "--wechat-id"),
+    url: str = typer.Option(..., "--url"),
+) -> None:
+    """手动设置订阅源 URL。"""
+
+    settings = get_settings()
+    init_db(settings)
+
+    with session_scope(settings) as session:
+        sub = session.scalar(select(Subscription).where(Subscription.wechat_id == wechat_id))
+        if sub is None:
+            typer.echo(f"未找到订阅: {wechat_id}")
+            _echo_ai_footer(settings)
+            return
+
+        sub.source_url = url
+        sub.source_status = SOURCE_STATUS_ACTIVE
+        sub.last_error = None
+        session.commit()
+        typer.echo(f"已更新源: {wechat_id}")
+    _echo_ai_footer(settings)
+
+
+@app.command("view")
+def view(
+    mode: ViewMode | None = typer.Option(None, "--mode", help="source/time/recommend"),
+    date_text: str | None = typer.Option(None, "--date", help="YYYY-MM-DD，默认当天"),
+    interactive: bool | None = typer.Option(
+        None,
+        "--interactive/--no-interactive",
+        help="view后进入已读交互模式。默认在TTY环境自动开启。",
+    ),
+    test_prev_day: bool = typer.Option(
+        False,
+        "--test-prev-day",
+        help="仅测试用：未传 --date 时，抓取并展示前一天数据。后续会移除该参数。",
+    ),
+) -> None:
+    """先同步后展示文章列表。"""
+
+    settings = get_settings()
+    init_db(settings)
+
+    mode_value = (mode.value if mode else settings.default_view_mode).lower()
+    if mode_value not in {"source", "time", "recommend"}:
+        raise typer.BadParameter("mode 必须是 source/time/recommend")
+
+    target_date = _parse_date(date_text)
+    if test_prev_day and date_text is None:
+        target_date = target_date - timedelta(days=1)
+        typer.echo("测试模式: 已切换为前一天数据。")
+
+    provider, sync_service = _build_runtime()
+    interactive_enabled = interactive
+    if interactive_enabled is None:
+        interactive_enabled = sys.stdin.isatty() and sys.stdout.isatty()
+
+    try:
+        with session_scope(settings) as session:
+            run = sync_service.sync(session=session, target_date=target_date, trigger="view")
+            session.commit()
+
+            items = _query_article_items(session=session, target_date=target_date, mode=mode_value)
+            typer.echo(f"同步完成: success={run.success_count}, fail={run.fail_count}")
+            rendered = render_article_items(items=items, mode=mode_value)
+            typer.echo(rendered, nl=False)
+            if interactive_enabled and items:
+                _interactive_read_loop(
+                    session=session,
+                    target_date=target_date,
+                    mode_value=mode_value,
+                )
+    finally:
+        provider.close()
+    _echo_ai_footer(settings)
+
+
+@read_app.command("mark")
+def read_mark(
+    article_id: int = typer.Option(..., "--article-id"),
+    state: ReadStateValue = typer.Option(..., "--state"),
+) -> None:
+    """标记文章已读/未读。"""
+
+    settings = get_settings()
+    init_db(settings)
+
+    is_read = state.value == "read"
+    service = ReadStateService()
+
+    with session_scope(settings) as session:
+        article = session.get(Article, article_id)
+        if article is None:
+            typer.echo(f"文章不存在: {article_id}")
+            _echo_ai_footer(settings)
+            return
+
+        service.mark(session=session, article_id=article_id, is_read=is_read)
+        session.commit()
+        typer.echo(f"已更新文章 {article_id} 状态为: {'read' if is_read else 'unread'}")
+    _echo_ai_footer(settings)
+
+
+def main() -> None:
+    app()
+
+
+if __name__ == "__main__":
+    main()
