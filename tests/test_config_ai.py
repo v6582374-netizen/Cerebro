@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from wechat_agent.config import get_settings
+from wechat_agent.config import DEFAULT_OPENAI_BASE_URL, get_settings
 
 
 def test_resolve_deepseek_auto(monkeypatch):
@@ -35,4 +35,19 @@ def test_resolve_openai_priority(monkeypatch):
     assert settings.resolved_api_key() == "openai-test-key"
     assert settings.resolved_chat_model() == "gpt-4o-mini"
     assert settings.resolved_embed_model() == "text-embedding-3-small"
+    get_settings.cache_clear()
+
+
+def test_default_openai_base_url(monkeypatch, tmp_path):
+    monkeypatch.setenv("WECHAT_AGENT_ENV_FILE", str(tmp_path / ".env"))
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("AI_PROVIDER", "openai")
+    get_settings.cache_clear()
+
+    settings = get_settings()
+
+    assert settings.openai_base_url == DEFAULT_OPENAI_BASE_URL
+    assert settings.resolved_base_url() == DEFAULT_OPENAI_BASE_URL
     get_settings.cache_clear()

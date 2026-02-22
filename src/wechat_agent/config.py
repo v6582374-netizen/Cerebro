@@ -3,11 +3,14 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 
 DEFAULT_TEMPLATE = "https://rsshub.app/wechat/mp/{wechat_id}"
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 
 @dataclass(frozen=True)
@@ -104,9 +107,22 @@ def _to_int(raw: str | None, default: int) -> int:
     return value
 
 
+def get_default_env_file() -> Path:
+    custom_path = os.getenv("WECHAT_AGENT_ENV_FILE", "").strip()
+    if custom_path:
+        return Path(custom_path).expanduser()
+
+    xdg_root = os.getenv("XDG_CONFIG_HOME", "").strip()
+    if xdg_root:
+        return Path(xdg_root).expanduser() / "wechat-agent" / ".env"
+    return Path.home() / ".config" / "wechat-agent" / ".env"
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    # Prefer a local .env for development; fill missing values from global config.
     load_dotenv(override=False)
+    load_dotenv(dotenv_path=get_default_env_file(), override=False)
 
     default_mode = os.getenv("DEFAULT_VIEW_MODE", "source").strip().lower()
     if default_mode not in {"source", "time", "recommend"}:
@@ -116,11 +132,11 @@ def get_settings() -> Settings:
         db_url=os.getenv("WECHAT_AGENT_DB_URL", "sqlite:///data/wechat_agent.db"),
         ai_provider=os.getenv("AI_PROVIDER", "auto"),
         openai_api_key=os.getenv("OPENAI_API_KEY") or None,
-        openai_base_url=os.getenv("OPENAI_BASE_URL") or None,
+        openai_base_url=os.getenv("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
         openai_chat_model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
         openai_embed_model=os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
         deepseek_api_key=os.getenv("DEEPSEEK_API_KEY") or None,
-        deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL),
         deepseek_chat_model=os.getenv("DEEPSEEK_CHAT_MODEL", "deepseek-chat"),
         deepseek_embed_model=os.getenv("DEEPSEEK_EMBED_MODEL", ""),
         source_templates=_parse_source_templates(os.getenv("SOURCE_TEMPLATES")),

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
+import os
 
 from typer.testing import CliRunner
 
@@ -154,3 +156,29 @@ def test_open_command(isolated_env, monkeypatch):
     assert opened.exit_code == 0
     assert "已尝试打开文章:" in opened.stdout
     assert "AI: provider=" in opened.stdout
+
+
+def test_config_api_interactive_writes_env(isolated_env):
+    env_path = Path(os.environ["WECHAT_AGENT_ENV_FILE"])
+    if env_path.exists():
+        env_path.unlink()
+
+    configured = runner.invoke(
+        app,
+        ["config", "api"],
+        input="openai\n\nsk-test-key\n",
+    )
+    assert configured.exit_code == 0
+    assert "配置已保存" in configured.stdout
+    assert "AI: provider=openai" in configured.stdout
+
+    content = env_path.read_text(encoding="utf-8")
+    assert "AI_PROVIDER=openai" in content
+    assert "OPENAI_BASE_URL=https://api.openai.com/v1" in content
+    assert "OPENAI_API_KEY=sk-test-key" in content
+
+    shown = runner.invoke(app, ["config", "show"])
+    assert shown.exit_code == 0
+    assert "OPENAI_BASE_URL=https://api.openai.com/v1" in shown.stdout
+    assert "OPENAI_API_KEY=sk-t...-key" in shown.stdout
+    assert "AI: provider=openai" in shown.stdout

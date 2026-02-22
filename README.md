@@ -37,15 +37,22 @@ pytest -q
 
 ## 3) AI 配置（支持 OpenAI / DeepSeek）
 
-复制 `.env.example` 为 `.env` 后配置：
+推荐直接使用交互命令配置（会写入全局配置文件 `~/.config/wechat-agent/.env`）：
+
+```bash
+wechat-agent config api
+wechat-agent config show
+```
+
+如需手动编辑，也可直接修改 `.env`：
 
 ```bash
 # 自动选择：优先 OPENAI_API_KEY，其次 DEEPSEEK_API_KEY
 AI_PROVIDER=auto
 
-# OpenAI
+# OpenAI（默认值已内置）
 OPENAI_API_KEY=
-OPENAI_BASE_URL=
+OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_CHAT_MODEL=gpt-4o-mini
 OPENAI_EMBED_MODEL=text-embedding-3-small
 
@@ -60,6 +67,7 @@ MIDNIGHT_SHIFT_DAYS=2
 ```
 
 说明：
+- `OPENAI_BASE_URL` 默认使用 OpenAI 官方接口地址 `https://api.openai.com/v1`。
 - 摘要会使用当前 provider 的 chat model。
 - 如果 embedding model 未配置或接口不可用，系统自动回退到本地向量（`local-hash`）。
 
@@ -104,6 +112,13 @@ wechat-agent open --article-id 12
 wechat-agent status
 ```
 
+配置管理：
+
+```bash
+wechat-agent config api
+wechat-agent config show
+```
+
 ## 5) 命令总览（简化版，便于记忆）
 
 建议先设 alias：
@@ -122,6 +137,8 @@ wa show -m recommend
 wa done -i 1,2,3
 wa todo -i 2
 wa open -i 12
+wa config api
+wa config show
 wa remove -i QbitAI
 wa status
 ```

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from datetime import date, datetime
 from enum import Enum
+from pathlib import Path
 import re
 import sys
 import webbrowser
@@ -12,7 +13,12 @@ from rich.console import Console
 from rich.table import Table
 from sqlalchemy import and_, case, func, select
 
-from .config import get_settings
+from .config import (
+    DEFAULT_DEEPSEEK_BASE_URL,
+    DEFAULT_OPENAI_BASE_URL,
+    get_default_env_file,
+    get_settings,
+)
 from .db import init_db, session_scope
 from .models import (
     Article,
@@ -40,8 +46,10 @@ from .views.table_renderer import render_article_items
 app = typer.Typer(help="微信公众号文章 CLI 聚合推荐系统", no_args_is_help=True)
 sub_app = typer.Typer(help="订阅管理")
 read_app = typer.Typer(help="阅读状态管理")
+config_app = typer.Typer(help="配置管理")
 app.add_typer(sub_app, name="sub")
 app.add_typer(read_app, name="read")
+app.add_typer(config_app, name="config")
 
 
 class ViewMode(str, Enum):
@@ -253,6 +261,80 @@ def _parse_id_list(raw_ids: str) -> list[int]:
     return result
 
 
+_ENV_LINE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
+
+
+def _resolve_env_path(custom_path: str | None) -> Path:
+    if custom_path:
+        return Path(custom_path).expanduser()
+    return get_default_env_file()
+
+
+def _read_env_values(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = _ENV_LINE_RE.match(line)
+        if not match:
+            continue
+        key = match.group(1)
+        value = match.group(2).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def _serialize_env_value(value: str) -> str:
+    if value == "":
+        return ""
+    if any(ch.isspace() for ch in value) or any(ch in value for ch in ['"', "'", "#"]):
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return value
+
+
+def _upsert_env_values(path: Path, updates: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw_lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    pending = dict(updates)
+    out_lines: list[str] = []
+
+    for line in raw_lines:
+        match = _ENV_LINE_RE.match(line)
+        if not match:
+            out_lines.append(line)
+            continue
+        key = match.group(1)
+        if key in pending:
+            out_lines.append(f"{key}={_serialize_env_value(pending.pop(key))}")
+        else:
+            out_lines.append(line)
+
+    if not raw_lines:
+        out_lines.append("# WeChat Agent configuration")
+
+    if pending:
+        if out_lines and out_lines[-1].strip() != "":
+            out_lines.append("")
+        for key, value in pending.items():
+            out_lines.append(f"{key}={_serialize_env_value(value)}")
+
+    path.write_text("\n".join(out_lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _mask_secret(value: str | None) -> str:
+    if not value:
+        return "(未配置)"
+    if len(value) <= 8:
+        return "********"
+    return f"{value[:4]}...{value[-4:]}"
+
+
 def _bulk_mark_read(ids_raw: str, is_read: bool) -> None:
     settings = get_settings()
     init_db(settings)
@@ -390,6 +472,90 @@ def status() -> None:
             typer.echo("失败项:")
             for name, error_message in failed_items:
                 typer.echo(f"- {name}: {error_message or '未知错误'}")
+    _echo_ai_footer(settings)
+
+
+@config_app.command("api")
+def config_api() -> None:
+    """交互式配置 AI Provider 与 API Key。"""
+
+    env_path = _resolve_env_path(custom_path=None)
+    current = _read_env_values(env_path)
+    typer.echo(f"配置文件: {env_path}")
+
+    allowed = {"auto", "openai", "deepseek"}
+    provider_default = current.get("AI_PROVIDER", "auto").strip().lower() or "auto"
+    provider = typer.prompt("AI_PROVIDER (auto/openai/deepseek)", default=provider_default).strip().lower()
+    while provider not in allowed:
+        typer.echo("仅支持 auto/openai/deepseek，请重新输入。")
+        provider = typer.prompt("AI_PROVIDER (auto/openai/deepseek)", default="auto").strip().lower()
+
+    updates: dict[str, str] = {"AI_PROVIDER": provider}
+
+    if provider in {"auto", "openai"}:
+        openai_base = current.get("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL).strip() or DEFAULT_OPENAI_BASE_URL
+        updates["OPENAI_BASE_URL"] = typer.prompt("OPENAI_BASE_URL", default=openai_base).strip() or DEFAULT_OPENAI_BASE_URL
+
+        existing_openai_key = current.get("OPENAI_API_KEY", "").strip()
+        if existing_openai_key:
+            if typer.confirm("检测到已配置 OPENAI_API_KEY，是否更新？", default=False):
+                updates["OPENAI_API_KEY"] = typer.prompt(
+                    "OPENAI_API_KEY", hide_input=True, confirmation_prompt=True
+                ).strip()
+        else:
+            updates["OPENAI_API_KEY"] = typer.prompt(
+                "OPENAI_API_KEY (可留空)", default="", show_default=False, hide_input=True
+            ).strip()
+
+    if provider in {"auto", "deepseek"}:
+        deepseek_base = current.get("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL).strip() or DEFAULT_DEEPSEEK_BASE_URL
+        updates["DEEPSEEK_BASE_URL"] = (
+            typer.prompt("DEEPSEEK_BASE_URL", default=deepseek_base).strip() or DEFAULT_DEEPSEEK_BASE_URL
+        )
+
+        existing_deepseek_key = current.get("DEEPSEEK_API_KEY", "").strip()
+        if existing_deepseek_key:
+            if typer.confirm("检测到已配置 DEEPSEEK_API_KEY，是否更新？", default=False):
+                updates["DEEPSEEK_API_KEY"] = typer.prompt(
+                    "DEEPSEEK_API_KEY", hide_input=True, confirmation_prompt=True
+                ).strip()
+        else:
+            updates["DEEPSEEK_API_KEY"] = typer.prompt(
+                "DEEPSEEK_API_KEY (可留空)", default="", show_default=False, hide_input=True
+            ).strip()
+
+    _upsert_env_values(path=env_path, updates=updates)
+    get_settings.cache_clear()
+    refreshed = get_settings()
+    typer.echo("配置已保存。")
+    typer.echo(f"当前 provider: {refreshed.ai_provider}")
+    _echo_ai_footer(refreshed)
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """显示当前配置文件与关键配置（敏感字段脱敏）。"""
+
+    env_path = _resolve_env_path(custom_path=None)
+    current = _read_env_values(env_path)
+    get_settings.cache_clear()
+    settings = get_settings()
+
+    typer.echo(f"配置文件: {env_path}")
+    if not env_path.exists():
+        typer.echo("配置文件不存在，可执行 `wechat-agent config api` 生成。")
+        _echo_ai_footer(settings)
+        return
+
+    provider = current.get("AI_PROVIDER", settings.ai_provider)
+    openai_base = current.get("OPENAI_BASE_URL", settings.openai_base_url or DEFAULT_OPENAI_BASE_URL)
+    deepseek_base = current.get("DEEPSEEK_BASE_URL", settings.deepseek_base_url)
+
+    typer.echo(f"AI_PROVIDER={provider}")
+    typer.echo(f"OPENAI_BASE_URL={openai_base}")
+    typer.echo(f"OPENAI_API_KEY={_mask_secret(current.get('OPENAI_API_KEY'))}")
+    typer.echo(f"DEEPSEEK_BASE_URL={deepseek_base}")
+    typer.echo(f"DEEPSEEK_API_KEY={_mask_secret(current.get('DEEPSEEK_API_KEY'))}")
     _echo_ai_footer(settings)
 
 
