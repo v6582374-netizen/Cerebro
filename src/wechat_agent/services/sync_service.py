@@ -119,6 +119,16 @@ class SyncService:
             )
         )
         if existing is not None:
+            published_at = raw.published_at
+            if published_at.tzinfo is None:
+                published_at = published_at.replace(tzinfo=timezone.utc)
+            # Keep historical records aligned with current publish-time normalization rules.
+            if existing.published_at != published_at:
+                existing.published_at = published_at
+            if (raw.content_excerpt or "") and existing.content_excerpt != raw.content_excerpt:
+                existing.content_excerpt = raw.content_excerpt
+            if (raw.raw_hash or "") and existing.raw_hash != raw.raw_hash:
+                existing.raw_hash = raw.raw_hash
             return False
 
         published_at = raw.published_at

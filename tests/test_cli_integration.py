@@ -150,3 +150,21 @@ def test_quick_alias_commands(isolated_env, monkeypatch):
     todo_out = runner.invoke(app, ["todo", "-i", "1"])
     assert todo_out.exit_code == 0
     assert "已批量更新 1 篇文章状态为: unread" in todo_out.stdout
+
+
+def test_open_command(isolated_env, monkeypatch):
+    monkeypatch.setattr("wechat_agent.providers.template_feed_provider.TemplateFeedProvider.fetch", _fake_fetch)
+    monkeypatch.setattr("wechat_agent.providers.template_feed_provider.TemplateFeedProvider.probe", _fake_probe)
+    monkeypatch.setattr(Summarizer, "summarize", _fake_summary)
+
+    add = runner.invoke(app, ["add", "-n", "号A", "-i", "gh_a"])
+    assert add.exit_code == 0
+    today = datetime.now().strftime("%Y-%m-%d")
+    show = runner.invoke(app, ["show", "-m", "source", "-d", today, "--no-interactive"])
+    assert show.exit_code == 0
+
+    monkeypatch.setattr("wechat_agent.cli.webbrowser.open", lambda *_args, **_kwargs: True)
+    opened = runner.invoke(app, ["open", "--article-id", "1"])
+    assert opened.exit_code == 0
+    assert "已尝试打开文章:" in opened.stdout
+    assert "AI: provider=" in opened.stdout

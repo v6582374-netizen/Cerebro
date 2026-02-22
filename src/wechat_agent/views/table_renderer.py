@@ -44,6 +44,7 @@ def _build_table(include_source: bool, include_score: bool) -> Table:
 def _title_cell(title: str, url: str) -> Text | str:
     if not url:
         return title
+    # Keep the exact original URL as click target to avoid parameter loss.
     return Text(title, style=f"link {url}")
 
 

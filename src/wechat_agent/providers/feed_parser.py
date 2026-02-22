@@ -34,6 +34,7 @@ def _entry_published_at(entry) -> datetime | None:
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
+_MIDNIGHT_TEXT_RE = re.compile(r"(?:^|\s)00:00(?::00)?(?:\s|$)")
 
 
 def _clean_excerpt(text: str) -> str:
@@ -68,6 +69,8 @@ def parse_feed(content: str | bytes, source_url: str, source_name: str | None = 
         title = str(entry.get("title") or "Untitled").strip() or "Untitled"
         url = str(entry.get("link") or source_url).strip() or source_url
         published_at = _entry_published_at(entry) or datetime.now(timezone.utc)
+        published_text = str(entry.get("published") or entry.get("updated") or "")
+        is_midnight_publish = bool(_MIDNIGHT_TEXT_RE.search(published_text))
         excerpt = _entry_excerpt(entry)
 
         external_id = str(entry.get("id") or "").strip()
@@ -85,6 +88,7 @@ def parse_feed(content: str | bytes, source_url: str, source_name: str | None = 
                 content_excerpt=excerpt,
                 raw_hash=digest,
                 source_name=source_name,
+                is_midnight_publish=is_midnight_publish,
             )
         )
 

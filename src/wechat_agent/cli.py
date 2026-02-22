@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 from enum import Enum
 import re
 import sys
+import webbrowser
 
 import typer
 from rich.console import Console
@@ -69,7 +70,10 @@ def _day_bounds(target_date: date) -> tuple[datetime, datetime]:
 
 def _build_runtime():
     settings = get_settings()
-    provider = TemplateFeedProvider(timeout_seconds=settings.http_timeout_seconds)
+    provider = TemplateFeedProvider(
+        timeout_seconds=settings.http_timeout_seconds,
+        midnight_shift_days=settings.midnight_shift_days,
+    )
     resolver = SourceResolver(
         templates=settings.source_templates,
         provider=provider,
@@ -284,7 +288,7 @@ def _interactive_read_loop(
 ) -> None:
     service = ReadStateService()
 
-    typer.echo("进入交互已读模式: r <ids> 标已读 | u <ids> 标未读 | t <ids> 切换 | p 重绘 | q 退出")
+    typer.echo("进入交互已读模式: r/u/t <ids> | o <id> 打开原文 | p 重绘 | q 退出")
     while True:
         try:
             raw = typer.prompt("read>").strip()
@@ -304,18 +308,28 @@ def _interactive_read_loop(
 
         pieces = raw.split(maxsplit=1)
         if len(pieces) != 2:
-            typer.echo("用法: r <ids> | u <ids> | t <ids> | p | q")
+            typer.echo("用法: r <ids> | u <ids> | t <ids> | o <id> | p | q")
             continue
 
         op, payload = pieces[0].lower(), pieces[1]
-        if op not in {"r", "u", "t"}:
-            typer.echo("未知操作，只支持 r/u/t/p/q")
+        if op not in {"r", "u", "t", "o"}:
+            typer.echo("未知操作，只支持 r/u/t/o/p/q")
             continue
 
         try:
             ids = _parse_id_list(payload)
         except ValueError as exc:
             typer.echo(str(exc))
+            continue
+
+        if op == "o":
+            article_id = ids[0]
+            article = session.get(Article, article_id)
+            if article is None:
+                typer.echo(f"文章不存在: {article_id}")
+                continue
+            ok = webbrowser.open(article.url, new=2)
+            typer.echo("已尝试打开浏览器。" if ok else "浏览器打开请求已发送（终端可能限制反馈）。")
             continue
 
         changed = 0
@@ -546,6 +560,27 @@ def read_mark(
         service.mark(session=session, article_id=article_id, is_read=is_read)
         session.commit()
         typer.echo(f"已更新文章 {article_id} 状态为: {'read' if is_read else 'unread'}")
+    _echo_ai_footer(settings)
+
+
+@app.command("open")
+def open_article(
+    article_id: int = typer.Option(..., "--article-id", "-i"),
+) -> None:
+    """直接在系统浏览器中打开原文。"""
+
+    settings = get_settings()
+    init_db(settings)
+    with session_scope(settings) as session:
+        article = session.get(Article, article_id)
+        if article is None:
+            typer.echo(f"文章不存在: {article_id}")
+            _echo_ai_footer(settings)
+            return
+        ok = webbrowser.open(article.url, new=2)
+        typer.echo(f"已尝试打开文章: {article.url}")
+        if not ok:
+            typer.echo("浏览器打开请求已发送，但当前终端可能限制可见反馈。")
     _echo_ai_footer(settings)
 
 

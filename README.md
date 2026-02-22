@@ -54,6 +54,9 @@ DEEPSEEK_API_KEY=
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_CHAT_MODEL=deepseek-chat
 DEEPSEEK_EMBED_MODEL=
+
+# 业务规则：00:00 发布时间按后两天归类（例如 23号00:00 -> 25号）
+MIDNIGHT_SHIFT_DAYS=2
 ```
 
 说明：
@@ -90,6 +93,9 @@ wechat-agent view --mode recommend
 # 单条
 wechat-agent read mark --article-id 12 --state read
 wechat-agent read mark --article-id 12 --state unread
+
+# 在系统浏览器打开原文
+wechat-agent open --article-id 12
 ```
 
 状态查看：
@@ -115,6 +121,7 @@ wa show -m source
 wa show -m recommend
 wa done -i 1,2,3
 wa todo -i 2
+wa open -i 12
 wa remove -i QbitAI
 wa status
 ```
@@ -129,12 +136,15 @@ wechat-agent view --mode source --interactive
 - `r 1,2` 标记已读
 - `u 3` 标记未读
 - `t 4` 切换已读状态
+- `o 4` 打开原文
 - `p` 重绘列表
 - `q` 退出
 
 ## 7) 输出说明
 
 - 标题列是可点击链接（支持 OSC 8 的终端可直接点击打开原文）。
+- 标题点击使用原始完整链接（保留全部 query 参数，避免参数丢失）。
+- 若终端对外链有安全拦截，使用 `wechat-agent open --article-id <id>` 强制调用系统浏览器打开。
 - AI 摘要优先基于正文全文提取后总结；正文抓取失败时自动回退。
 - 每次命令输出末尾都会显示当前 AI 引擎信息，例如：
   - `AI: provider=openai | summary=gpt-4o-mini | embedding=text-embedding-3-small`

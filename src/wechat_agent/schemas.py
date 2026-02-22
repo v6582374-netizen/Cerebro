@@ -13,6 +13,7 @@ class RawArticle:
     content_excerpt: str
     raw_hash: str
     source_name: str | None = None
+    is_midnight_publish: bool = False
 
 
 @dataclass(slots=True)

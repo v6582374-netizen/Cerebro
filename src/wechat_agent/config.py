@@ -29,6 +29,7 @@ class Settings:
     wechat2rss_index_url: str
     article_fetch_timeout_seconds: int
     summary_source_char_limit: int
+    midnight_shift_days: int
 
     def resolved_ai_provider(self) -> str:
         provider = self.ai_provider.strip().lower()
@@ -129,4 +130,5 @@ def get_settings() -> Settings:
         wechat2rss_index_url=os.getenv("WECHAT2RSS_INDEX_URL", "https://wechat2rss.xlab.app/list/all/"),
         article_fetch_timeout_seconds=_to_int(os.getenv("ARTICLE_FETCH_TIMEOUT_SECONDS"), 15),
         summary_source_char_limit=_to_int(os.getenv("SUMMARY_SOURCE_CHAR_LIMIT"), 6000),
+        midnight_shift_days=_to_int(os.getenv("MIDNIGHT_SHIFT_DAYS"), 2),
     )
