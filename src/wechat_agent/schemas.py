@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 
 @dataclass(slots=True)
@@ -85,3 +85,42 @@ class SourceFetchResult:
     latency_ms: int
     error_kind: str | None = None
     error_message: str | None = None
+
+
+@dataclass(slots=True)
+class AuthSession:
+    provider: str
+    encrypted_blob: str
+    expires_at: datetime | None
+    updated_at: datetime
+
+
+@dataclass(slots=True)
+class DiscoveredArticleRef:
+    url: str
+    title_hint: str | None
+    published_at_hint: datetime | None
+    channel: str
+    confidence: float
+
+
+@dataclass(slots=True)
+class DiscoveryResult:
+    ok: bool
+    refs: list[DiscoveredArticleRef]
+    channel_used: str | None
+    error_kind: str | None
+    error_message: str | None
+    latency_ms: int
+    status: str
+
+
+@dataclass(slots=True)
+class CoverageReport:
+    date: date
+    total_subs: int
+    success_subs: int
+    delayed_subs: int
+    fail_subs: int
+    coverage_ratio: float
+    detail_json: str

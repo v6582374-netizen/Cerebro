@@ -1,27 +1,25 @@
-# WeChat Agent CLI
+# WeChat Agent CLI (V2)
 
-本项目用于聚合微信公众号文章、生成 AI 摘要、并在终端进行推荐阅读和已读管理。
+本项目是一个本地运行的微信公众号文章聚合工具：
+- 用户只需添加公众号名
+- `view` 时触发抓取（无后台常驻）
+- 默认走免费发现链路（本地登录态 + 公开检索）
+- 支持阅读状态、每日 ID、历史回看、推荐视图
 
-## 1) 用户安装（不需要虚拟环境）
-
-面向最终用户，直接用包管理器全局安装即可，在任意目录都能执行 `wechat-agent`。
+## 用户安装（全局可用）
 
 ```bash
-# 推荐：从 GitHub 安装最新版本
+# 推荐：pipx
 pipx install "git+https://github.com/v6582374-netizen/Cerebro.git"
 
-# 或
+# 或：uv tool
 uv tool install "git+https://github.com/v6582374-netizen/Cerebro.git"
-
-# 本地开发源码全局可用（可实时反映代码修改）
-uv tool install -e /Users/shiwen/Desktop/Wechat_agent
 ```
 
-升级 / 卸载：
+本地源码调试后也可全局挂载：
 
 ```bash
-pipx upgrade wechat-agent
-pipx uninstall wechat-agent
+uv tool install -e /Users/shiwen/Desktop/Wechat_agent
 ```
 
 如果出现 `zsh: command not found: wechat-agent`：
@@ -32,190 +30,141 @@ exec zsh
 which wechat-agent
 ```
 
-## 2) 开发者模式（仅本地调试）
+## 开发者模式（仅本地开发）
 
-`uv` 只用于开发调试，不是面向用户的安装方式。
+> `uv` 只用于开发调试，不是终端用户使用门槛。
 
 ```bash
 uv venv .venv
 source .venv/bin/activate
 uv pip install -e ".[dev]"
-pytest -q
+uv run ruff check
+uv run pytest -q
 ```
 
-## 3) AI 配置（支持 OpenAI / DeepSeek）
+## 配置（直接使用 `.env`）
 
-推荐直接使用交互命令配置（会写入全局配置文件 `~/.config/wechat-agent/.env`）：
+全局配置文件路径：`~/.config/wechat-agent/.env`
+
+推荐交互式配置：
 
 ```bash
 wechat-agent config api
 wechat-agent config show
 ```
 
-如需手动编辑，也可直接修改 `.env`：
+常用配置项：
 
 ```bash
-# 自动选择：优先 OPENAI_API_KEY，其次 DEEPSEEK_API_KEY
+# AI（可选，未配置会走本地免费 fallback 摘要/向量）
 AI_PROVIDER=auto
-
-# OpenAI（默认值已内置）
 OPENAI_API_KEY=
 OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_CHAT_MODEL=gpt-4o-mini
 OPENAI_EMBED_MODEL=text-embedding-3-small
-
-# DeepSeek
 DEEPSEEK_API_KEY=
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_CHAT_MODEL=deepseek-chat
 DEEPSEEK_EMBED_MODEL=
 
-# 业务规则：00:00 发布时间按后两天归类（例如 23号00:00 -> 25号）
-MIDNIGHT_SHIFT_DAYS=2
+# V2 发现链路开关
+DISCOVERY_V2_ENABLED=true
+SESSION_PROVIDER=weread
+SESSION_BACKEND=auto
+COVERAGE_SLA_TARGET=0.95
 
-# 同步优化：每次 view 只增量抓取（基于上次成功同步时间）
+# 同步与时间规则
 SYNC_OVERLAP_SECONDS=120
 INCREMENTAL_SYNC_ENABLED=true
+MIDNIGHT_SHIFT_DAYS=2
+```
 
-# V1.2 稳定性参数（多源容灾 + 熔断）
-SOURCE_MAX_CANDIDATES=3
-SOURCE_RETRY_BACKOFF_MS=800
-SOURCE_CIRCUIT_FAIL_THRESHOLD=3
-SOURCE_COOLDOWN_MINUTES=30
+## 核心命令
+
+### 1) 登录态管理（本地保存）
+
+```bash
+wechat-agent login --provider weread
+wechat-agent logout --provider weread
 ```
 
 说明：
-- `OPENAI_BASE_URL` 默认使用 OpenAI 官方接口地址 `https://api.openai.com/v1`。
-- 摘要会使用当前 provider 的 chat model。
-- 如果 embedding model 未配置或接口不可用，系统自动回退到本地向量（`local-hash`）。
+- 登录态只存本机（优先 Keychain，或本地文件后备）
+- `status` 会显示 `session_state=valid/expired/missing`
 
-## 4) 命令总览（完整）
-
-订阅管理：
+### 2) 订阅管理
 
 ```bash
+# 只需公众号名（推荐）
+wechat-agent sub add --name "量子位"
+
+# 兼容参数（将弃用）
 wechat-agent sub add --name "量子位" --wechat-id QbitAI
+
 wechat-agent sub list
 wechat-agent sub remove --wechat-id QbitAI
-wechat-agent sub set-source --wechat-id QbitAI --url "https://..."
-wechat-agent set-source --id QbitAI --url "https://..."   # 快捷别名
 ```
 
-源路由诊断（V1.2 新增）：
+### 3) 查看与历史
 
 ```bash
-wechat-agent source list --wechat-id QbitAI
-wechat-agent source doctor
-wechat-agent source doctor --wechat-id QbitAI
-wechat-agent source pin --wechat-id QbitAI --provider manual --url "https://..."
-wechat-agent source unpin --wechat-id QbitAI
-```
-
-文章查看：
-
-```bash
-# 默认按订阅号分组
+# 查看（先同步再展示）
 wechat-agent view --mode source
-
-# 严格实时模式（不展示缓存兜底）
-wechat-agent view --mode source --strict-live
-
-# 按时间
-wechat-agent view --mode time --date 2026-02-22
-
-# 按推荐
+wechat-agent view --mode time --date 2026-02-23
 wechat-agent view --mode recommend
 
-# 历史查询（只查库，不触发抓取；date 必填）
+# 严格实时（不使用缓存兜底）
+wechat-agent view --mode source --strict-live
+
+# 历史（只查库，不触发抓取）
 wechat-agent history --date 2026-02-22 --mode source
 ```
 
-已读管理：
+### 4) 阅读状态与打开原文（每日 ID）
 
 ```bash
-# 单条（使用“当日ID”，可配合 --date 查询历史日）
 wechat-agent read mark --id 1 --state read
 wechat-agent read mark --id 1 --state unread
-wechat-agent read mark --date 2026-02-22 --id 3 --state read
-
-# 批量
 wechat-agent done --ids 1,2,3
-wechat-agent todo --ids 2
-wechat-agent done --date 2026-02-22 --ids 1,3
-
-# 在系统浏览器打开原文（按当日ID）
+wechat-agent todo --ids 2,5
 wechat-agent open --id 1
-wechat-agent open --date 2026-02-22 --id 3
+
+# 指定日期（日内 ID）
+wechat-agent open --id 3 --date 2026-02-22
 ```
 
-状态查看：
+### 5) 状态与覆盖率
 
 ```bash
 wechat-agent status
+wechat-agent coverage --date 2026-02-23
 ```
 
-配置管理：
-
-```bash
-wechat-agent config api
-wechat-agent config show
-```
-
-## 5) 命令总览（简化版，便于记忆）
-
-建议先设 alias：
-
-```bash
-alias wa='wechat-agent'
-```
-
-然后用短命令：
-
-```bash
-wa add -n "量子位" -i QbitAI
-wa list
-wa show -m source
-wa show -m source --strict-live
-wa show -m recommend
-wa history --date 2026-02-22 -m source
-wa source doctor
-wa source list --wechat-id QbitAI
-wa source pin --wechat-id QbitAI --provider manual --url "https://..."
-wa done -i 1,2,3
-wa todo -i 2
-wa open -i 1
-wa config api
-wa config show
-wa remove -i QbitAI
-wa status
-```
-
-## 6) 终端交互已读（最方便）
+## 交互模式（终端内快速已读操作）
 
 ```bash
 wechat-agent view --mode source --interactive
 ```
 
-进入后可直接操作：
+可用操作：
 - `r 1,2` 标记已读
 - `u 3` 标记未读
-- `t 4` 切换已读状态
+- `t 4` 切换状态
 - `o 4` 打开原文
-- `p` 重绘列表
+- `p` 重绘
 - `q` 退出
 
-## 7) 输出说明
+## 输出与行为说明
 
-- 标题列是可点击链接（支持 OSC 8 的终端可直接点击打开原文）。
-- 标题点击使用原始完整链接（保留全部 query 参数，避免参数丢失）。
-- 若终端对外链有安全拦截，使用 `wechat-agent open --id <day_id> [--date YYYY-MM-DD]` 强制调用系统浏览器打开。
-- AI 摘要优先基于正文全文提取后总结；正文抓取失败时自动回退。
-- 摘要长度统一控制在 50 字以内，避免终端展示时出现过长粘连。
-- 用户可见 ID 为“每日ID”（每个日期从 1 开始），不再使用数据库全局ID。
-- `history` 命令只查本地库，不触发抓取；`view` 命令会触发增量同步。
-- V1.2 默认启用“稳定优先”模式：当实时抓取失败时，优先展示本地缓存并标记状态。
-- `view` 会输出 `live_sources_ok / live_sources_failed / stale_sources_used` 三个指标。
-- `status` 会输出 provider+error_kind 聚合，快速定位是否镜像源故障。
-- 已移除 `--test-prev-day` 测试参数，日期归类统一由发布时刻规则自动处理。
-- 每次命令输出末尾都会显示当前 AI 引擎信息，例如：
-  - `AI: provider=openai | summary=gpt-4o-mini | embedding=text-embedding-3-small`
+- 标题为可点击链接（OSC 8 终端）
+- 每次命令末尾都会输出当前 AI 引擎信息
+- `view` 会输出发现指标：`discover_ok / discover_delayed / discover_failed / coverage_ratio`
+- 失败时默认允许缓存兜底，并标记“使用缓存(延迟xx小时)”
+- `--strict-live` 会过滤掉缓存结果
+- `history` 不会触发抓取
+- 用户可见 ID 为“每日 ID”（每个日期从 1 开始）
+
+## 精简说明
+
+- 已移除手工 RSS 源命令（`source` / `set-source`），统一为自动发现。
+- `sub add --wechat-id` 仅做短期兼容保留，推荐只用 `sub add --name`。

@@ -205,32 +205,6 @@ def test_history_does_not_trigger_sync(isolated_env, monkeypatch):
     assert "CLI 集成测试文章" in history_out.stdout
 
 
-def test_source_pin_and_list(isolated_env):
-    add = runner.invoke(app, ["sub", "add", "--name", "号A", "--wechat-id", "gh_a"])
-    assert add.exit_code == 0
-
-    pin = runner.invoke(
-        app,
-        [
-            "source",
-            "pin",
-            "--wechat-id",
-            "gh_a",
-            "--provider",
-            "manual",
-            "--url",
-            "https://example.com/manual.xml",
-        ],
-    )
-    assert pin.exit_code == 0
-    assert "已置顶源" in pin.stdout
-
-    listed = runner.invoke(app, ["source", "list", "--wechat-id", "gh_a"])
-    assert listed.exit_code == 0
-    assert "manual" in listed.stdout
-    assert "https://example.com/manual.xml" in listed.stdout
-
-
 def test_view_stale_fallback_and_strict_live(isolated_env, monkeypatch):
     monkeypatch.setattr(Summarizer, "summarize", _fake_summary)
     monkeypatch.setattr(
@@ -275,7 +249,7 @@ def test_view_stale_fallback_and_strict_live(isolated_env, monkeypatch):
     monkeypatch.setattr("wechat_agent.providers.template_feed_provider.TemplateFeedProvider.fetch", fetch_partial_fail)
     stale_view = runner.invoke(app, ["view", "--mode", "source", "--date", today, "--no-interactive"])
     assert stale_view.exit_code == 0
-    assert "stale_sources_used=1" in stale_view.stdout
+    assert "discover_delayed=1" in stale_view.stdout
     assert "状态: 使用缓存" in stale_view.stdout
     assert "gh_b-标题" in stale_view.stdout
 
@@ -284,7 +258,7 @@ def test_view_stale_fallback_and_strict_live(isolated_env, monkeypatch):
         ["view", "--mode", "source", "--date", today, "--strict-live", "--no-interactive"],
     )
     assert strict_live.exit_code == 0
-    assert "stale_sources_used=0" in strict_live.stdout
+    assert "discover_delayed=0" in strict_live.stdout
     assert "状态: 完全失败(待修复)" in strict_live.stdout
     assert "gh_a-标题" in strict_live.stdout
     assert "gh_b-标题" not in strict_live.stdout

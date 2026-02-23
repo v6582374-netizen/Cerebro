@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from enum import Enum
+import hashlib
+import json
 from pathlib import Path
 import re
 import sys
@@ -11,7 +13,7 @@ import webbrowser
 import typer
 from rich.console import Console
 from rich.table import Table
-from sqlalchemy import and_, case, func, select
+from sqlalchemy import and_, case, delete, func, select
 
 from .config import (
     DEFAULT_DEEPSEEK_BASE_URL,
@@ -22,32 +24,37 @@ from .config import (
 from .db import init_db, session_scope
 from .models import (
     Article,
+    ArticleRef,
     ArticleSummary,
+    AuthSessionEntry,
+    DISCOVERY_STATUS_DELAYED,
+    DISCOVERY_STATUS_FAILED,
+    DISCOVERY_STATUS_SUCCESS,
+    DiscoveryRun,
     FETCH_STATUS_FAILED,
     FetchAttempt,
-    HEALTH_STATE_OPEN,
     ReadState,
     RecommendationScoreEntry,
     SOURCE_STATUS_ACTIVE,
-    SOURCE_MODE_AUTO,
-    SOURCE_MODE_MANUAL,
     SOURCE_STATUS_PENDING,
-    SourceHealth,
     Subscription,
-    SubscriptionSource,
     SYNC_ITEM_STATUS_FAILED,
     SYNC_ITEM_STATUS_SUCCESS,
     SyncRun,
     SyncRunItem,
     utcnow,
 )
+from .providers.search_index_provider import SearchIndexProvider
 from .providers.template_feed_provider import TemplateFeedProvider
-from .schemas import ArticleViewItem
+from .providers.weread_discovery_provider import WeReadDiscoveryProvider
+from .schemas import ArticleViewItem, DiscoveredArticleRef
+from .services.coverage_service import CoverageService
+from .services.discovery_orchestrator import DiscoveryOrchestrator
 from .services.fetcher import Fetcher
 from .services.read_state import ReadStateService
 from .services.recommender import Recommender
+from .services.session_vault import SessionVault
 from .services.source_gateway import (
-    MANUAL_PROVIDER,
     ManualSourceProvider,
     SourceGateway,
     SourceHealthService,
@@ -66,11 +73,9 @@ app = typer.Typer(help="微信公众号文章 CLI 聚合推荐系统", no_args_i
 sub_app = typer.Typer(help="订阅管理")
 read_app = typer.Typer(help="阅读状态管理")
 config_app = typer.Typer(help="配置管理")
-source_app = typer.Typer(help="源路由与诊断")
 app.add_typer(sub_app, name="sub")
 app.add_typer(read_app, name="read")
 app.add_typer(config_app, name="config")
-app.add_typer(source_app, name="source")
 
 
 class ViewMode(str, Enum):
@@ -126,14 +131,24 @@ def _build_runtime():
         base_url=base_url,
         embed_model=embed_model,
     )
-    sync_service = SyncService(
-        resolver=resolver,
-        fetcher=fetcher,
-        summarizer=summarizer,
-        recommender=recommender,
-        sync_overlap_seconds=settings.sync_overlap_seconds,
-        incremental_sync_enabled=settings.incremental_sync_enabled,
-        source_gateway=SourceGateway(
+    discovery_orchestrator: DiscoveryOrchestrator | None = None
+    source_gateway: SourceGateway | None = None
+    closers: list[object] = [provider]
+    if settings.discovery_v2_enabled:
+        session_vault = SessionVault(backend=settings.session_backend)
+        discovery_orchestrator = DiscoveryOrchestrator(
+            providers=[
+                WeReadDiscoveryProvider(timeout_seconds=settings.http_timeout_seconds),
+                SearchIndexProvider(timeout_seconds=settings.http_timeout_seconds),
+            ],
+            session_vault=session_vault,
+            session_provider=settings.session_provider,
+            timeout_seconds=settings.http_timeout_seconds,
+            midnight_shift_days=settings.midnight_shift_days,
+        )
+        closers.append(discovery_orchestrator)
+    else:
+        source_gateway = SourceGateway(
             providers=[
                 ManualSourceProvider(feed_provider=provider),
                 TemplateMirrorSourceProvider(templates=settings.source_templates, feed_provider=provider),
@@ -146,9 +161,18 @@ def _build_runtime():
             ),
             max_candidates=settings.source_max_candidates,
             retry_backoff_ms=settings.source_retry_backoff_ms,
-        ),
+        )
+    sync_service = SyncService(
+        resolver=resolver,
+        fetcher=fetcher,
+        summarizer=summarizer,
+        recommender=recommender,
+        sync_overlap_seconds=settings.sync_overlap_seconds,
+        incremental_sync_enabled=settings.incremental_sync_enabled,
+        source_gateway=source_gateway,
+        discovery_orchestrator=discovery_orchestrator,
     )
-    return provider, sync_service
+    return closers, sync_service
 
 
 def _ai_footer(settings) -> str:
@@ -302,7 +326,7 @@ def _sync_run_new_stats(session, run_id: int) -> tuple[int, list[str]]:
 
 def _source_last_ok_by_subscription(session) -> dict[int, datetime]:
     rows = session.execute(
-        select(SourceHealth.subscription_id, func.max(SourceHealth.last_ok_at)).group_by(SourceHealth.subscription_id)
+        select(Article.subscription_id, func.max(Article.published_at)).group_by(Article.subscription_id)
     ).all()
     return {int(sub_id): last_ok for sub_id, last_ok in rows if last_ok is not None}
 
@@ -314,6 +338,35 @@ def _sync_run_live_metrics(
     target_date: date,
     strict_live: bool = False,
 ) -> tuple[int, int, int, dict[str, str]]:
+    discovery_rows = session.execute(
+        select(Subscription.id, Subscription.name, DiscoveryRun.status)
+        .join(Subscription, Subscription.id == DiscoveryRun.subscription_id)
+        .where(DiscoveryRun.sync_run_id == run_id)
+        .order_by(Subscription.name.asc())
+    ).all()
+    if discovery_rows:
+        last_ok_by_sub = _source_last_ok_by_subscription(session)
+        discover_ok = 0
+        discover_failed = 0
+        discover_delayed = 0
+        source_status_lines: dict[str, str] = {}
+        for sub_id, source_name, status in discovery_rows:
+            if status == DISCOVERY_STATUS_SUCCESS:
+                discover_ok += 1
+                source_status_lines[str(source_name)] = "实时成功"
+                continue
+            if status == DISCOVERY_STATUS_DELAYED and not strict_live:
+                discover_delayed += 1
+                lag_hours = stale_hours(last_ok_by_sub.get(int(sub_id)), now=utcnow())
+                if lag_hours is None:
+                    source_status_lines[str(source_name)] = "使用缓存(延迟未知)"
+                else:
+                    source_status_lines[str(source_name)] = f"使用缓存(延迟{lag_hours}小时)"
+                continue
+            discover_failed += 1
+            source_status_lines[str(source_name)] = "完全失败(待修复)"
+        return discover_ok, discover_failed, discover_delayed, source_status_lines
+
     rows = session.execute(
         select(Subscription.id, Subscription.name, SyncRunItem.status)
         .join(Subscription, Subscription.id == SyncRunItem.subscription_id)
@@ -359,6 +412,17 @@ def _sync_run_live_metrics(
 
 
 def _live_success_source_names(session, run_id: int) -> set[str]:
+    discovery_rows = session.execute(
+        select(Subscription.name)
+        .join(DiscoveryRun, DiscoveryRun.subscription_id == Subscription.id)
+        .where(
+            DiscoveryRun.sync_run_id == run_id,
+            DiscoveryRun.status == DISCOVERY_STATUS_SUCCESS,
+        )
+    ).all()
+    if discovery_rows:
+        return {str(name) for (name,) in discovery_rows}
+
     rows = session.execute(
         select(Subscription.name)
         .join(SyncRunItem, SyncRunItem.subscription_id == Subscription.id)
@@ -411,19 +475,17 @@ def _render_subscription_table(subscriptions: list[Subscription]) -> str:
     console = Console(record=True, force_terminal=False, color_system=None, width=140)
     table = Table(show_header=True, header_style="bold")
     table.add_column("公众号")
-    table.add_column("微信号")
-    table.add_column("状态")
-    table.add_column("优先Provider")
-    table.add_column("源URL")
+    table.add_column("订阅ID")
+    table.add_column("发现状态")
+    table.add_column("同步状态")
     table.add_column("错误信息")
 
     for sub in subscriptions:
         table.add_row(
             sub.name,
             sub.wechat_id,
+            sub.discovery_status or SOURCE_STATUS_PENDING,
             sub.source_status,
-            sub.preferred_provider or "-",
-            sub.source_url or "-",
             sub.last_error or "-",
         )
 
@@ -519,49 +581,83 @@ def _mask_secret(value: str | None) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
-def _pin_subscription_source(
+def _candidate_label(ref: DiscoveredArticleRef) -> str:
+    title = (ref.title_hint or "（无标题）").strip()
+    title = re.sub(r"\s+", " ", title)
+    if len(title) > 48:
+        title = f"{title[:48]}..."
+    return f"[{ref.channel}|{ref.confidence:.2f}] {title}"
+
+
+def _select_discovery_candidate(refs: list[DiscoveredArticleRef]) -> DiscoveredArticleRef | None:
+    if not refs:
+        return None
+    top = refs[:5]
+    if len(top) == 1:
+        return top[0]
+    if top[0].confidence - top[1].confidence >= 0.2:
+        return top[0]
+
+    typer.echo("发现多个可能匹配的候选文章，请选择最接近该公众号的一项：")
+    for idx, ref in enumerate(top, start=1):
+        typer.echo(f"{idx}. {_candidate_label(ref)}")
+        typer.echo(f"   {ref.url}")
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        typer.echo("当前非交互终端，默认选择候选 1。")
+        return top[0]
+
+    raw = typer.prompt("输入候选编号(1-5，0为暂不绑定)", default="1").strip()
+    try:
+        picked = int(raw)
+    except ValueError:
+        picked = 1
+    if picked <= 0 or picked > len(top):
+        return None
+    return top[picked - 1]
+
+
+def _hash_secret(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _upsert_auth_session(
     session,
     *,
-    sub: Subscription,
     provider: str,
-    url: str,
+    secret: str,
+    expires_at: datetime | None,
 ) -> None:
-    current_sources = session.scalars(
-        select(SubscriptionSource).where(SubscriptionSource.subscription_id == sub.id)
-    ).all()
-    for row in current_sources:
-        row.is_pinned = False
-
-    source = session.scalar(
-        select(SubscriptionSource).where(
-            SubscriptionSource.subscription_id == sub.id,
-            SubscriptionSource.provider == provider,
-            SubscriptionSource.source_url == url,
+    existing = session.get(AuthSessionEntry, provider)
+    digest = _hash_secret(secret)
+    if existing is None:
+        session.add(
+            AuthSessionEntry(
+                provider=provider,
+                encrypted_blob=digest,
+                expires_at=expires_at,
+            )
         )
-    )
-    if source is None:
-        source = SubscriptionSource(
-            subscription_id=sub.id,
-            provider=provider,
-            source_url=url,
-            priority=0,
-            is_pinned=True,
-            is_active=True,
-            confidence=1.0 if provider == MANUAL_PROVIDER else 0.8,
-            metadata_json='{"pinned_by":"user"}',
-        )
-        session.add(source)
-    else:
-        source.priority = 0
-        source.is_pinned = True
-        source.is_active = True
-        source.confidence = max(float(source.confidence or 0.0), 0.8)
+        return
+    existing.encrypted_blob = digest
+    existing.expires_at = expires_at
 
-    sub.source_url = url
-    sub.preferred_provider = provider
-    sub.source_mode = SOURCE_MODE_MANUAL if provider == MANUAL_PROVIDER else SOURCE_MODE_AUTO
-    sub.source_status = SOURCE_STATUS_ACTIVE
-    sub.last_error = None
+
+def _session_state(session, settings) -> str:
+    provider = settings.session_provider
+    row = session.get(AuthSessionEntry, provider)
+    if row is None:
+        return "missing"
+    now = utcnow()
+    if row.expires_at is not None:
+        expires_at = row.expires_at if row.expires_at.tzinfo else row.expires_at.replace(tzinfo=now.tzinfo)
+        if expires_at < now:
+            return "expired"
+    vault = SessionVault(backend=settings.session_backend)
+    secret = vault.get(provider)
+    if not secret:
+        return "missing"
+    return "valid"
 
 
 def _bulk_mark_read(ids_raw: str, is_read: bool, target_date: date) -> None:
@@ -729,6 +825,7 @@ def status() -> None:
         typer.echo(
             f"最近同步 #{run.id} | 触发方式: {run.trigger} | 成功: {run.success_count} | 失败: {run.fail_count}"
         )
+        typer.echo(f"session_state={_session_state(session=session, settings=settings)}")
         new_total, no_new_sources = _sync_run_new_stats(session=session, run_id=run.id)
         typer.echo(f"新增文章: {new_total}")
         if no_new_sources:
@@ -761,6 +858,147 @@ def status() -> None:
             typer.echo("错误聚合(provider + error_kind):")
             for provider_name, error_kind, count in error_rows:
                 typer.echo(f"- {provider_name}:{error_kind or 'UNKNOWN'} -> {count}")
+
+        discovery_error_rows = session.execute(
+            select(DiscoveryRun.error_kind, func.count())
+            .where(
+                DiscoveryRun.sync_run_id == run.id,
+                DiscoveryRun.status == DISCOVERY_STATUS_FAILED,
+            )
+            .group_by(DiscoveryRun.error_kind)
+            .order_by(func.count().desc())
+            .limit(5)
+        ).all()
+        if discovery_error_rows:
+            typer.echo("发现错误聚合(error_kind):")
+            for error_kind, count in discovery_error_rows:
+                typer.echo(f"- {error_kind or 'UNKNOWN'} -> {count}")
+    _echo_ai_footer(settings)
+
+
+@app.command("login")
+def login(
+    provider: str = typer.Option("weread", "--provider"),
+    token: str | None = typer.Option(None, "--token", help="登录态Cookie，可留空进入安全输入"),
+    expires_days: int = typer.Option(30, "--expires-days", min=1, max=365),
+) -> None:
+    """保存本地登录态（仅本机，不上传）。"""
+
+    settings = get_settings()
+    init_db(settings)
+    provider_name = provider.strip().lower() or settings.session_provider
+    raw_token = token
+    if raw_token is None:
+        raw_token = typer.prompt("请输入登录态Cookie", hide_input=True)
+    if provider_name == "weread":
+        raw_token = WeReadDiscoveryProvider.parse_token_from_input(raw_token)
+    secret = (raw_token or "").strip()
+    if not secret:
+        typer.echo("登录态为空，未保存。")
+        _echo_ai_footer(settings)
+        return
+
+    vault = SessionVault(backend=settings.session_backend)
+    try:
+        vault.set(provider_name, secret)
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"保存登录态失败: {exc}")
+        _echo_ai_footer(settings)
+        return
+
+    expires_at = utcnow() + timedelta(days=expires_days)
+    with session_scope(settings) as session:
+        _upsert_auth_session(
+            session=session,
+            provider=provider_name,
+            secret=secret,
+            expires_at=expires_at,
+        )
+        session.commit()
+    typer.echo(f"登录态已保存: provider={provider_name}, expires_at={expires_at.isoformat()}")
+    _echo_ai_footer(settings)
+
+
+@app.command("logout")
+def logout(
+    provider: str = typer.Option("weread", "--provider"),
+) -> None:
+    """删除本地登录态。"""
+
+    settings = get_settings()
+    init_db(settings)
+    provider_name = provider.strip().lower() or settings.session_provider
+    vault = SessionVault(backend=settings.session_backend)
+    try:
+        vault.delete(provider_name)
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"删除登录态失败: {exc}")
+        _echo_ai_footer(settings)
+        return
+    with session_scope(settings) as session:
+        row = session.get(AuthSessionEntry, provider_name)
+        if row is not None:
+            session.delete(row)
+            session.commit()
+    typer.echo(f"登录态已删除: provider={provider_name}")
+    _echo_ai_footer(settings)
+
+
+@app.command("coverage")
+def coverage(
+    date_text: str = typer.Option(..., "--date", help="YYYY-MM-DD"),
+) -> None:
+    """输出指定日期覆盖率与分布。"""
+
+    settings = get_settings()
+    init_db(settings)
+    target_date = _parse_date(date_text)
+    service = CoverageService()
+    with session_scope(settings) as session:
+        report = service.compute(session=session, target_date=target_date)
+        session.commit()
+        typer.echo(
+            "覆盖率报告: "
+            f"date={report.date.isoformat()}, total={report.total_subs}, "
+            f"success={report.success_subs}, delayed={report.delayed_subs}, "
+            f"fail={report.fail_subs}, coverage_ratio={report.coverage_ratio:.3f}"
+        )
+        try:
+            details = json.loads(report.detail_json)
+        except Exception:
+            details = []
+        if isinstance(details, list) and details:
+            error_counts: dict[str, int] = defaultdict(int)
+            for row in details:
+                if not isinstance(row, dict):
+                    continue
+                status = str(row.get("status") or "")
+                error_kind = str(row.get("error_kind") or "")
+                if status != DISCOVERY_STATUS_SUCCESS and error_kind:
+                    error_counts[error_kind] += 1
+
+            console = Console(record=True, force_terminal=False, color_system=None, width=140)
+            table = Table(show_header=True, header_style="bold")
+            table.add_column("公众号")
+            table.add_column("状态", width=10)
+            table.add_column("错误分类", width=16)
+            for row in details:
+                if not isinstance(row, dict):
+                    continue
+                table.add_row(
+                    str(row.get("name") or "-"),
+                    str(row.get("status") or "-"),
+                    str(row.get("error_kind") or "-"),
+                )
+            with console.capture() as capture:
+                console.print(table)
+            typer.echo(capture.get(), nl=False)
+            if error_counts:
+                typer.echo("失败原因分布:")
+                for error_kind, count in sorted(error_counts.items(), key=lambda item: item[1], reverse=True):
+                    typer.echo(f"- {error_kind}: {count}")
+        if report.coverage_ratio < settings.coverage_sla_target:
+            typer.echo("告警: 覆盖率低于SLA阈值，请检查登录态与发现通道可用性。")
     _echo_ai_footer(settings)
 
 
@@ -845,32 +1083,110 @@ def config_show() -> None:
     typer.echo(f"OPENAI_API_KEY={_mask_secret(current.get('OPENAI_API_KEY'))}")
     typer.echo(f"DEEPSEEK_BASE_URL={deepseek_base}")
     typer.echo(f"DEEPSEEK_API_KEY={_mask_secret(current.get('DEEPSEEK_API_KEY'))}")
+    typer.echo(f"DISCOVERY_V2_ENABLED={settings.discovery_v2_enabled}")
+    typer.echo(f"SESSION_PROVIDER={settings.session_provider}")
+    typer.echo(f"SESSION_BACKEND={settings.session_backend}")
+    typer.echo(f"COVERAGE_SLA_TARGET={settings.coverage_sla_target:.2f}")
     _echo_ai_footer(settings)
 
 
 @sub_app.command("add")
-def sub_add(name: str = typer.Option(..., "--name"), wechat_id: str = typer.Option(..., "--wechat-id")) -> None:
-    """新增订阅。"""
+def sub_add(
+    name: str = typer.Option(..., "--name"),
+    wechat_id: str | None = typer.Option(None, "--wechat-id"),
+) -> None:
+    """新增订阅（V2: 仅需公众号名，系统自动发现）。"""
 
     settings = get_settings()
     init_db(settings)
+    candidate_wechat_id = (wechat_id or "").strip()
+    if not candidate_wechat_id:
+        slug = re.sub(r"[^0-9a-zA-Z]+", "", name).lower()[:24] or "sub"
+        candidate_wechat_id = f"auto_{slug}_{hashlib.sha1(name.encode('utf-8')).hexdigest()[:8]}"
+        typer.echo("未提供 wechat_id，已自动生成订阅标识。")
+    else:
+        typer.echo("提示: --wechat-id 将在后续版本弃用，建议仅传 --name。")
 
     with session_scope(settings) as session:
-        existing = session.scalar(select(Subscription).where(Subscription.wechat_id == wechat_id))
+        existing = session.scalar(select(Subscription).where(Subscription.wechat_id == candidate_wechat_id))
         if existing:
-            typer.echo(f"已存在订阅: {wechat_id}")
+            typer.echo(f"已存在订阅: {candidate_wechat_id}")
             _echo_ai_footer(settings)
             return
 
-        session.add(
-            Subscription(
-                name=name,
-                wechat_id=wechat_id,
-                source_status=SOURCE_STATUS_PENDING,
-            )
+        sub = Subscription(
+            name=name,
+            wechat_id=candidate_wechat_id,
+            source_status=SOURCE_STATUS_PENDING,
+            discovery_status=SOURCE_STATUS_PENDING,
         )
+        session.add(sub)
+        session.flush()
+
+        discovery_note = ""
+        if settings.discovery_v2_enabled:
+            orchestrator = DiscoveryOrchestrator(
+                providers=[
+                    WeReadDiscoveryProvider(timeout_seconds=settings.http_timeout_seconds),
+                    SearchIndexProvider(timeout_seconds=settings.http_timeout_seconds),
+                ],
+                session_vault=SessionVault(backend=settings.session_backend),
+                session_provider=settings.session_provider,
+                timeout_seconds=settings.http_timeout_seconds,
+                midnight_shift_days=settings.midnight_shift_days,
+            )
+            try:
+                target_date = datetime.now().date()
+                day_start, _ = _day_bounds(target_date)
+                discovery_result = orchestrator.discover(
+                    session=session,
+                    sub=sub,
+                    target_date=target_date,
+                    since=day_start,
+                )
+            except Exception as exc:  # noqa: BLE001
+                discovery_result = None
+                sub.discovery_status = SOURCE_STATUS_PENDING
+                sub.last_error = f"PENDING_DISCOVERY: {exc}"
+                discovery_note = "首次自动发现异常，已标记待发现，后续 view 会自动重试。"
+            finally:
+                orchestrator.close()
+
+            if discovery_result is not None:
+                if not discovery_result.ok or not discovery_result.refs:
+                    sub.discovery_status = SOURCE_STATUS_PENDING
+                    sub.last_error = f"PENDING_DISCOVERY: {discovery_result.error_kind or 'SEARCH_EMPTY'}"
+                    discovery_note = "首次自动发现未命中，已标记待发现，后续 view 会自动重试。"
+                else:
+                    selected = _select_discovery_candidate(discovery_result.refs)
+                    if selected is None:
+                        sub.discovery_status = SOURCE_STATUS_PENDING
+                        sub.last_error = "PENDING_DISCOVERY: 候选未确认"
+                        discovery_note = "已创建订阅，暂未确认候选，后续 view 会继续自动发现。"
+                    else:
+                        session.execute(
+                            delete(ArticleRef).where(
+                                ArticleRef.subscription_id == sub.id,
+                                ArticleRef.url != selected.url,
+                            )
+                        )
+                        chosen = session.scalar(
+                            select(ArticleRef).where(
+                                ArticleRef.subscription_id == sub.id,
+                                ArticleRef.url == selected.url,
+                            )
+                        )
+                        if chosen is not None:
+                            chosen.confidence = max(float(chosen.confidence or 0.0), 1.0)
+                        sub.discovery_status = DISCOVERY_STATUS_SUCCESS
+                        sub.source_status = SOURCE_STATUS_ACTIVE
+                        sub.last_error = None
+                        discovery_note = f"已自动绑定候选: {selected.url}"
+
         session.commit()
-        typer.echo(f"已新增订阅: {name} ({wechat_id})")
+        typer.echo(f"已新增订阅: {name} ({candidate_wechat_id})")
+        if discovery_note:
+            typer.echo(discovery_note)
     _echo_ai_footer(settings)
 
 
@@ -913,224 +1229,6 @@ def sub_remove(wechat_id: str = typer.Option(..., "--wechat-id")) -> None:
     _echo_ai_footer(settings)
 
 
-@sub_app.command("set-source")
-def sub_set_source(
-    wechat_id: str = typer.Option(..., "--wechat-id"),
-    url: str = typer.Option(..., "--url"),
-) -> None:
-    """手动设置订阅源 URL。"""
-
-    settings = get_settings()
-    init_db(settings)
-
-    with session_scope(settings) as session:
-        sub = session.scalar(select(Subscription).where(Subscription.wechat_id == wechat_id))
-        if sub is None:
-            typer.echo(f"未找到订阅: {wechat_id}")
-            _echo_ai_footer(settings)
-            return
-
-        _pin_subscription_source(
-            session=session,
-            sub=sub,
-            provider=MANUAL_PROVIDER,
-            url=url,
-        )
-        session.commit()
-        typer.echo(f"已更新源: {wechat_id}")
-    _echo_ai_footer(settings)
-
-
-@source_app.command("list")
-def source_list(
-    wechat_id: str = typer.Option(..., "--wechat-id"),
-) -> None:
-    """查看某个订阅号的候选源列表与健康状态。"""
-
-    settings = get_settings()
-    init_db(settings)
-    with session_scope(settings) as session:
-        sub = session.scalar(select(Subscription).where(Subscription.wechat_id == wechat_id))
-        if sub is None:
-            typer.echo(f"未找到订阅: {wechat_id}")
-            _echo_ai_footer(settings)
-            return
-
-        rows = session.execute(
-            select(
-                SubscriptionSource.provider,
-                SubscriptionSource.source_url,
-                SubscriptionSource.is_pinned,
-                SubscriptionSource.is_active,
-                SubscriptionSource.priority,
-                SourceHealth.state,
-                SourceHealth.score,
-                SourceHealth.last_error,
-            )
-            .outerjoin(
-                SourceHealth,
-                and_(
-                    SourceHealth.subscription_id == SubscriptionSource.subscription_id,
-                    SourceHealth.provider == SubscriptionSource.provider,
-                    SourceHealth.source_url == SubscriptionSource.source_url,
-                ),
-            )
-            .where(SubscriptionSource.subscription_id == sub.id)
-            .order_by(SubscriptionSource.is_pinned.desc(), SubscriptionSource.priority.asc())
-        ).all()
-        if not rows:
-            typer.echo("暂无候选源记录。")
-            _echo_ai_footer(settings)
-            return
-
-        console = Console(record=True, force_terminal=False, color_system=None, width=180)
-        table = Table(show_header=True, header_style="bold")
-        table.add_column("Provider", width=16)
-        table.add_column("Pinned", width=8)
-        table.add_column("Active", width=8)
-        table.add_column("Priority", width=8)
-        table.add_column("Health", width=10)
-        table.add_column("Score", width=8)
-        table.add_column("URL", overflow="fold")
-        table.add_column("LastError", overflow="fold")
-
-        for row in rows:
-            table.add_row(
-                str(row[0]),
-                "yes" if bool(row[2]) else "no",
-                "yes" if bool(row[3]) else "no",
-                str(row[4]),
-                str(row[5] or "-"),
-                f"{float(row[6] or 0.0):.1f}",
-                str(row[1]),
-                str(row[7] or "-"),
-            )
-        with console.capture() as capture:
-            console.print(table)
-        typer.echo(capture.get(), nl=False)
-    _echo_ai_footer(settings)
-
-
-@source_app.command("pin")
-def source_pin(
-    wechat_id: str = typer.Option(..., "--wechat-id"),
-    provider: str = typer.Option(..., "--provider"),
-    url: str = typer.Option(..., "--url"),
-) -> None:
-    """手工指定并置顶一个候选源。"""
-
-    settings = get_settings()
-    init_db(settings)
-    with session_scope(settings) as session:
-        sub = session.scalar(select(Subscription).where(Subscription.wechat_id == wechat_id))
-        if sub is None:
-            typer.echo(f"未找到订阅: {wechat_id}")
-            _echo_ai_footer(settings)
-            return
-        _pin_subscription_source(
-            session=session,
-            sub=sub,
-            provider=provider.strip() or MANUAL_PROVIDER,
-            url=url.strip(),
-        )
-        session.commit()
-        typer.echo(f"已置顶源: {wechat_id} -> {provider}")
-    _echo_ai_footer(settings)
-
-
-@source_app.command("unpin")
-def source_unpin(
-    wechat_id: str = typer.Option(..., "--wechat-id"),
-) -> None:
-    """取消一个订阅号的 pinned 源。"""
-
-    settings = get_settings()
-    init_db(settings)
-    with session_scope(settings) as session:
-        sub = session.scalar(select(Subscription).where(Subscription.wechat_id == wechat_id))
-        if sub is None:
-            typer.echo(f"未找到订阅: {wechat_id}")
-            _echo_ai_footer(settings)
-            return
-        rows = session.scalars(
-            select(SubscriptionSource).where(
-                SubscriptionSource.subscription_id == sub.id,
-                SubscriptionSource.is_pinned.is_(True),
-            )
-        ).all()
-        for row in rows:
-            row.is_pinned = False
-        sub.source_mode = SOURCE_MODE_AUTO
-        if sub.preferred_provider == MANUAL_PROVIDER:
-            sub.preferred_provider = None
-        session.commit()
-        typer.echo(f"已取消置顶源: {wechat_id}")
-    _echo_ai_footer(settings)
-
-
-@source_app.command("doctor")
-def source_doctor(
-    wechat_id: str | None = typer.Option(None, "--wechat-id"),
-) -> None:
-    """诊断源状态并给出修复建议。"""
-
-    settings = get_settings()
-    init_db(settings)
-    with session_scope(settings) as session:
-        stmt = select(Subscription)
-        if wechat_id:
-            stmt = stmt.where(Subscription.wechat_id == wechat_id)
-        subscriptions = session.scalars(stmt.order_by(Subscription.name.asc())).all()
-        if not subscriptions:
-            typer.echo("未找到可诊断的订阅。")
-            _echo_ai_footer(settings)
-            return
-
-        latest_run_id = session.scalar(select(SyncRun.id).order_by(SyncRun.started_at.desc()).limit(1))
-        latest_errors: dict[int, str] = {}
-        if latest_run_id is not None:
-            for sub_id, error in session.execute(
-                select(SyncRunItem.subscription_id, SyncRunItem.error_message).where(
-                    SyncRunItem.sync_run_id == latest_run_id,
-                    SyncRunItem.status == SYNC_ITEM_STATUS_FAILED,
-                )
-            ).all():
-                latest_errors[int(sub_id)] = str(error or "")
-
-        console = Console(record=True, force_terminal=False, color_system=None, width=180)
-        table = Table(show_header=True, header_style="bold")
-        table.add_column("公众号", width=18)
-        table.add_column("状态", width=12)
-        table.add_column("健康分", width=8)
-        table.add_column("建议", overflow="fold")
-        table.add_column("最近错误", overflow="fold")
-
-        for sub in subscriptions:
-            top_health = session.scalar(
-                select(SourceHealth)
-                .where(SourceHealth.subscription_id == sub.id)
-                .order_by(SourceHealth.score.desc())
-                .limit(1)
-            )
-            score = float(top_health.score) if top_health else 0.0
-            state = str(top_health.state) if top_health else "UNKNOWN"
-            last_error = latest_errors.get(sub.id) or sub.last_error or "-"
-            if state == HEALTH_STATE_OPEN:
-                advice = "源熔断中，稍后自动半开重试；可先手工 source pin。"
-            elif score < 40:
-                advice = "健康分偏低，建议 source pin 绑定稳定源。"
-            elif sub.source_status != SOURCE_STATUS_ACTIVE:
-                advice = "当前未激活，建议执行 view 触发自动修复。"
-            else:
-                advice = "状态正常，可继续观察。"
-            table.add_row(sub.name, state, f"{score:.1f}", advice, last_error)
-
-        with console.capture() as capture:
-            console.print(table)
-        typer.echo(capture.get(), nl=False)
-    _echo_ai_footer(settings)
-
-
 @app.command("view")
 def view(
     mode: ViewMode | None = typer.Option(None, "--mode", help="source/time/recommend"),
@@ -1153,7 +1251,7 @@ def view(
 
     target_date = _parse_date(date_text)
 
-    provider, sync_service = _build_runtime()
+    resources, sync_service = _build_runtime()
     interactive_enabled = interactive
     if interactive_enabled is None:
         interactive_enabled = sys.stdin.isatty() and sys.stdout.isatty()
@@ -1172,16 +1270,19 @@ def view(
             )
             source_names = _all_subscription_names(session) if mode_value == "source" else None
             new_total, no_new_sources = _sync_run_new_stats(session=session, run_id=run.id)
-            live_ok, live_failed, stale_used, source_status_lines = _sync_run_live_metrics(
+            discover_ok, discover_failed, discover_delayed, source_status_lines = _sync_run_live_metrics(
                 session=session,
                 run_id=run.id,
                 target_date=target_date,
                 strict_live=strict_live,
             )
+            total_subs = max(len(source_names or []), 1)
+            coverage_ratio = (discover_ok + discover_delayed) / total_subs
             typer.echo(
                 "同步完成: "
                 f"success={run.success_count}, fail={run.fail_count}, new={new_total}, "
-                f"live_sources_ok={live_ok}, live_sources_failed={live_failed}, stale_sources_used={stale_used}"
+                f"discover_ok={discover_ok}, discover_delayed={discover_delayed}, "
+                f"discover_failed={discover_failed}, coverage_ratio={coverage_ratio:.3f}"
             )
             if no_new_sources:
                 typer.echo(f"本轮无新增: {'、'.join(no_new_sources)}")
@@ -1201,7 +1302,13 @@ def view(
                     source_status_lines=source_status_lines if mode_value == "source" else None,
                 )
     finally:
-        provider.close()
+        for resource in resources:
+            close_fn = getattr(resource, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
     _echo_ai_footer(settings)
 
 
@@ -1324,7 +1431,7 @@ def open_article(
 @app.command("add")
 def quick_add(
     name: str = typer.Option(..., "--name", "-n"),
-    wechat_id: str = typer.Option(..., "--id", "-i"),
+    wechat_id: str | None = typer.Option(None, "--id", "-i"),
 ) -> None:
     """快捷命令：新增订阅。"""
 
@@ -1345,16 +1452,6 @@ def quick_remove(
     """快捷命令：删除订阅。"""
 
     sub_remove(wechat_id=wechat_id)
-
-
-@app.command("set-source")
-def quick_source(
-    wechat_id: str = typer.Option(..., "--id", "-i"),
-    url: str = typer.Option(..., "--url"),
-) -> None:
-    """快捷命令：手动设置订阅源。"""
-
-    sub_set_source(wechat_id=wechat_id, url=url)
 
 
 @app.command("show")

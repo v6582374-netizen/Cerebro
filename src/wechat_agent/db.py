@@ -73,6 +73,7 @@ def _sqlite_auto_migrate(engine: Engine, db_url: str) -> None:
         "subscriptions": {
             "preferred_provider": "VARCHAR(64)",
             "source_mode": "VARCHAR(32) NOT NULL DEFAULT 'auto'",
+            "discovery_status": "VARCHAR(32) NOT NULL DEFAULT 'PENDING'",
         },
     }
 

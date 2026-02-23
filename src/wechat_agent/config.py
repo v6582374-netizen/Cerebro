@@ -42,6 +42,10 @@ class Settings:
     source_retry_backoff_ms: int
     source_circuit_fail_threshold: int
     source_cooldown_minutes: int
+    discovery_v2_enabled: bool
+    session_provider: str
+    session_backend: str
+    coverage_sla_target: float
 
     def resolved_ai_provider(self) -> str:
         provider = self.ai_provider.strip().lower()
@@ -127,6 +131,15 @@ def _to_bool(raw: str | None, default: bool) -> bool:
     return default
 
 
+def _to_float(raw: str | None, default: float) -> float:
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def get_default_env_file() -> Path:
     custom_path = os.getenv("WECHAT_AGENT_ENV_FILE", "").strip()
     if custom_path:
@@ -173,4 +186,8 @@ def get_settings() -> Settings:
         source_retry_backoff_ms=_to_int(os.getenv("SOURCE_RETRY_BACKOFF_MS"), 800),
         source_circuit_fail_threshold=_to_int(os.getenv("SOURCE_CIRCUIT_FAIL_THRESHOLD"), 3),
         source_cooldown_minutes=_to_int(os.getenv("SOURCE_COOLDOWN_MINUTES"), 30),
+        discovery_v2_enabled=_to_bool(os.getenv("DISCOVERY_V2_ENABLED"), True),
+        session_provider=os.getenv("SESSION_PROVIDER", "weread"),
+        session_backend=os.getenv("SESSION_BACKEND", "auto"),
+        coverage_sla_target=max(0.0, min(1.0, _to_float(os.getenv("COVERAGE_SLA_TARGET"), 0.95))),
     )

@@ -9,6 +9,10 @@ from sqlalchemy.orm import Session
 from ..models import (
     Article,
     ArticleSummary,
+    DISCOVERY_STATUS_DELAYED,
+    DISCOVERY_STATUS_FAILED,
+    DISCOVERY_STATUS_SUCCESS,
+    DiscoveryRun,
     SOURCE_STATUS_ACTIVE,
     SOURCE_STATUS_MATCH_FAILED,
     SYNC_ITEM_STATUS_FAILED,
@@ -21,6 +25,7 @@ from ..models import (
 from ..schemas import RawArticle
 from ..time_utils import local_day_bounds_utc
 from .fetcher import Fetcher
+from .discovery_orchestrator import DiscoveryOrchestrator
 from .recommender import Recommender
 from .source_gateway import SourceGateway
 from .source_resolver import SourceResolver
@@ -37,6 +42,7 @@ class SyncService:
         sync_overlap_seconds: int = 120,
         incremental_sync_enabled: bool = True,
         source_gateway: SourceGateway | None = None,
+        discovery_orchestrator: DiscoveryOrchestrator | None = None,
     ) -> None:
         self.resolver = resolver
         self.fetcher = fetcher
@@ -45,6 +51,7 @@ class SyncService:
         self.sync_overlap_seconds = max(sync_overlap_seconds, 0)
         self.incremental_sync_enabled = incremental_sync_enabled
         self.source_gateway = source_gateway
+        self.discovery_orchestrator = discovery_orchestrator
 
     def sync(self, session: Session, target_date: date, trigger: str = "view") -> SyncRun:
         run = SyncRun(trigger=trigger, started_at=utcnow(), success_count=0, fail_count=0)
@@ -52,6 +59,7 @@ class SyncService:
         session.flush()
 
         day_start, _ = local_day_bounds_utc(target_date)
+        _, day_end = local_day_bounds_utc(target_date)
         last_success_map = self._last_success_time_by_subscription(session)
         new_article_ids: list[int] = []
 
@@ -69,6 +77,9 @@ class SyncService:
                 sub=sub,
                 since=since,
                 new_article_ids=new_article_ids,
+                target_date=target_date,
+                day_start=day_start,
+                day_end=day_end,
             )
 
         self._refresh_low_quality_summaries(session=session, article_ids=new_article_ids)
@@ -106,7 +117,22 @@ class SyncService:
         sub: Subscription,
         since: datetime,
         new_article_ids: list[int],
+        target_date: date,
+        day_start: datetime,
+        day_end: datetime,
     ) -> None:
+        if self.discovery_orchestrator is not None:
+            self._sync_subscription_v3(
+                session=session,
+                run=run,
+                sub=sub,
+                since=since,
+                new_article_ids=new_article_ids,
+                target_date=target_date,
+                day_start=day_start,
+                day_end=day_end,
+            )
+            return
         if self.source_gateway is not None:
             self._sync_subscription_v2(
                 session=session,
@@ -122,6 +148,104 @@ class SyncService:
             sub=sub,
             since=since,
             new_article_ids=new_article_ids,
+        )
+
+    def _sync_subscription_v3(
+        self,
+        session: Session,
+        run: SyncRun,
+        sub: Subscription,
+        since: datetime,
+        new_article_ids: list[int],
+        target_date: date,
+        day_start: datetime,
+        day_end: datetime,
+    ) -> None:
+        result = self.discovery_orchestrator.discover(
+            session=session,
+            sub=sub,
+            target_date=target_date,
+            since=since,
+        )
+        cached_exists = self._has_cached_articles(session=session, sub=sub, day_start=day_start, day_end=day_end)
+        if not result.ok:
+            if cached_exists:
+                sub.discovery_status = DISCOVERY_STATUS_DELAYED
+                sub.source_status = SOURCE_STATUS_MATCH_FAILED
+                sub.last_error = result.error_message
+                run.success_count += 1
+                session.add(
+                    SyncRunItem(
+                        sync_run_id=run.id,
+                        subscription_id=sub.id,
+                        status=SYNC_ITEM_STATUS_SUCCESS,
+                        new_count=0,
+                        error_message=f"DELAYED: {result.error_kind or 'SEARCH_EMPTY'}",
+                    )
+                )
+                session.add(
+                    DiscoveryRun(
+                        sync_run_id=run.id,
+                        subscription_id=sub.id,
+                        channel=result.channel_used or "discovery_v2",
+                        status=DISCOVERY_STATUS_DELAYED,
+                        ref_count=0,
+                        error_kind=result.error_kind,
+                        error_message=result.error_message,
+                        latency_ms=result.latency_ms,
+                    )
+                )
+                return
+
+            sub.discovery_status = DISCOVERY_STATUS_FAILED
+            sub.source_status = SOURCE_STATUS_MATCH_FAILED
+            sub.last_error = result.error_message or "发现失败"
+            run.fail_count += 1
+            session.add(
+                SyncRunItem(
+                    sync_run_id=run.id,
+                    subscription_id=sub.id,
+                    status=SYNC_ITEM_STATUS_FAILED,
+                    new_count=0,
+                    error_message=f"{result.error_kind or 'SEARCH_EMPTY'}: {sub.last_error}",
+                )
+            )
+            session.add(
+                DiscoveryRun(
+                    sync_run_id=run.id,
+                    subscription_id=sub.id,
+                    channel=result.channel_used or "discovery_v2",
+                    status=DISCOVERY_STATUS_FAILED,
+                    ref_count=0,
+                    error_kind=result.error_kind,
+                    error_message=result.error_message,
+                    latency_ms=result.latency_ms,
+                )
+            )
+            return
+
+        raw_articles = self.discovery_orchestrator.materialize_raw_articles(refs=result.refs, since=since)
+        self._record_success_items(
+            session=session,
+            run=run,
+            sub=sub,
+            raw_articles=raw_articles,
+            new_article_ids=new_article_ids,
+        )
+        sub.discovery_status = DISCOVERY_STATUS_SUCCESS
+        sub.source_status = SOURCE_STATUS_ACTIVE
+        sub.last_error = None
+        session.add(
+            DiscoveryRun(
+                sync_run_id=run.id,
+                subscription_id=sub.id,
+                channel=result.channel_used or "discovery_v2",
+                status=DISCOVERY_STATUS_SUCCESS,
+                ref_count=len(result.refs),
+                error_kind=None,
+                error_message=None,
+                latency_ms=result.latency_ms,
+            )
         )
 
     def _sync_subscription_v1(
@@ -244,6 +368,16 @@ class SyncService:
                 error_message=None,
             )
         )
+
+    def _has_cached_articles(self, session: Session, sub: Subscription, day_start: datetime, day_end: datetime) -> bool:
+        row = session.scalar(
+            select(Article.id).where(
+                Article.subscription_id == sub.id,
+                Article.published_at >= day_start,
+                Article.published_at < day_end,
+            )
+        )
+        return row is not None
 
     def _upsert_article(self, session: Session, sub: Subscription, raw: RawArticle) -> int | None:
         existing = session.scalar(

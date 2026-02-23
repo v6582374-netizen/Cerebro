@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -25,6 +25,10 @@ FETCH_STATUS_SUCCESS = "SUCCESS"
 FETCH_STATUS_FAILED = "FAILED"
 FETCH_STATUS_SKIPPED = "SKIPPED"
 
+DISCOVERY_STATUS_SUCCESS = "SUCCESS"
+DISCOVERY_STATUS_DELAYED = "DELAYED"
+DISCOVERY_STATUS_FAILED = "FAILED"
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -41,6 +45,7 @@ class Subscription(Base):
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     preferred_provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
     source_mode: Mapped[str] = mapped_column(String(32), nullable=False, default=SOURCE_MODE_AUTO)
+    discovery_status: Mapped[str] = mapped_column(String(32), nullable=False, default=SOURCE_STATUS_PENDING)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
@@ -49,6 +54,8 @@ class Subscription(Base):
     articles: Mapped[list[Article]] = relationship(back_populates="subscription", cascade="all, delete")
     sources: Mapped[list[SubscriptionSource]] = relationship(back_populates="subscription", cascade="all, delete")
     source_health: Mapped[list[SourceHealth]] = relationship(back_populates="subscription", cascade="all, delete")
+    discovery_runs: Mapped[list[DiscoveryRun]] = relationship(back_populates="subscription", cascade="all, delete")
+    article_refs: Mapped[list[ArticleRef]] = relationship(back_populates="subscription", cascade="all, delete")
 
 
 class Article(Base):
@@ -209,3 +216,62 @@ class FetchAttempt(Base):
     error_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class AuthSessionEntry(Base):
+    __tablename__ = "auth_sessions"
+
+    provider: Mapped[str] = mapped_column(String(64), primary_key=True)
+    encrypted_blob: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class DiscoveryRun(Base):
+    __tablename__ = "discovery_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sync_run_id: Mapped[int] = mapped_column(ForeignKey("sync_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    subscription_id: Mapped[int] = mapped_column(
+        ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    channel: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    ref_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    subscription: Mapped[Subscription] = relationship(back_populates="discovery_runs")
+
+
+class ArticleRef(Base):
+    __tablename__ = "article_refs"
+    __table_args__ = (UniqueConstraint("subscription_id", "url", name="uq_article_ref_sub_url"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    subscription_id: Mapped[int] = mapped_column(
+        ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    title_hint: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    published_at_hint: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    channel: Mapped[str] = mapped_column(String(64), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    subscription: Mapped[Subscription] = relationship(back_populates="article_refs")
+
+
+class CoverageDaily(Base):
+    __tablename__ = "coverage_daily"
+
+    date: Mapped[date] = mapped_column(Date, primary_key=True)
+    total_subs: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    success_subs: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    delayed_subs: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    fail_subs: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    coverage_ratio: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    detail_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
