@@ -29,6 +29,7 @@ from .models import (
     SOURCE_STATUS_PENDING,
     Subscription,
     SYNC_ITEM_STATUS_FAILED,
+    SYNC_ITEM_STATUS_SUCCESS,
     SyncRun,
     SyncRunItem,
 )
@@ -235,6 +236,28 @@ def _query_article_items(session, target_date: date, mode: str) -> list[ArticleV
     return items
 
 
+def _all_subscription_names(session) -> list[str]:
+    rows = session.execute(select(Subscription.name).order_by(Subscription.name.asc())).all()
+    return [str(name) for (name,) in rows]
+
+
+def _sync_run_new_stats(session, run_id: int) -> tuple[int, list[str]]:
+    rows = session.execute(
+        select(Subscription.name, SyncRunItem.status, SyncRunItem.new_count)
+        .join(Subscription, Subscription.id == SyncRunItem.subscription_id)
+        .where(SyncRunItem.sync_run_id == run_id)
+        .order_by(Subscription.name.asc())
+    ).all()
+    new_total = 0
+    no_new_sources: list[str] = []
+    for source_name, status, new_count in rows:
+        count = int(new_count or 0)
+        new_total += count
+        if status == SYNC_ITEM_STATUS_SUCCESS and count == 0:
+            no_new_sources.append(str(source_name))
+    return new_total, no_new_sources
+
+
 def _build_day_id_maps(session, target_date: date) -> tuple[dict[int, int], dict[int, int]]:
     day_start, day_end = _day_bounds(target_date)
     rows = session.execute(
@@ -423,6 +446,7 @@ def _interactive_read_loop(
     session,
     target_date: date,
     mode_value: str,
+    source_names: list[str] | None = None,
 ) -> None:
     service = ReadStateService()
 
@@ -441,7 +465,7 @@ def _interactive_read_loop(
             return
         if raw.lower() in {"p", "print"}:
             items = _query_article_items(session=session, target_date=target_date, mode=mode_value)
-            typer.echo(render_article_items(items=items, mode=mode_value), nl=False)
+            typer.echo(render_article_items(items=items, mode=mode_value, source_names=source_names), nl=False)
             continue
 
         pieces = raw.split(maxsplit=1)
@@ -509,7 +533,7 @@ def _interactive_read_loop(
         session.commit()
         items = _query_article_items(session=session, target_date=target_date, mode=mode_value)
         typer.echo(f"已更新 {changed} 篇文章状态。")
-        typer.echo(render_article_items(items=items, mode=mode_value), nl=False)
+        typer.echo(render_article_items(items=items, mode=mode_value, source_names=source_names), nl=False)
 
 
 @app.command("status")
@@ -529,6 +553,10 @@ def status() -> None:
         typer.echo(
             f"最近同步 #{run.id} | 触发方式: {run.trigger} | 成功: {run.success_count} | 失败: {run.fail_count}"
         )
+        new_total, no_new_sources = _sync_run_new_stats(session=session, run_id=run.id)
+        typer.echo(f"新增文章: {new_total}")
+        if no_new_sources:
+            typer.echo(f"成功但无新增: {'、'.join(no_new_sources)}")
 
         failed_items = session.execute(
             select(Subscription.name, SyncRunItem.error_message)
@@ -752,14 +780,19 @@ def view(
             session.commit()
 
             items = _query_article_items(session=session, target_date=target_date, mode=mode_value)
-            typer.echo(f"同步完成: success={run.success_count}, fail={run.fail_count}")
-            rendered = render_article_items(items=items, mode=mode_value)
+            source_names = _all_subscription_names(session) if mode_value == "source" else None
+            new_total, no_new_sources = _sync_run_new_stats(session=session, run_id=run.id)
+            typer.echo(f"同步完成: success={run.success_count}, fail={run.fail_count}, new={new_total}")
+            if no_new_sources:
+                typer.echo(f"本轮无新增: {'、'.join(no_new_sources)}")
+            rendered = render_article_items(items=items, mode=mode_value, source_names=source_names)
             typer.echo(rendered, nl=False)
             if interactive_enabled and items:
                 _interactive_read_loop(
                     session=session,
                     target_date=target_date,
                     mode_value=mode_value,
+                    source_names=source_names,
                 )
     finally:
         provider.close()
@@ -792,7 +825,8 @@ def history(
 
     with session_scope(settings) as session:
         items = _query_article_items(session=session, target_date=target_date, mode=mode_value)
-        rendered = render_article_items(items=items, mode=mode_value)
+        source_names = _all_subscription_names(session) if mode_value == "source" else None
+        rendered = render_article_items(items=items, mode=mode_value, source_names=source_names)
         typer.echo(f"历史查询: date={target_date.isoformat()}, mode={mode_value}")
         typer.echo(rendered, nl=False)
         if interactive_enabled and items:
@@ -800,6 +834,7 @@ def history(
                 session=session,
                 target_date=target_date,
                 mode_value=mode_value,
+                source_names=source_names,
             )
     _echo_ai_footer(settings)
 

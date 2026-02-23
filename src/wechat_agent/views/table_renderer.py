@@ -70,29 +70,41 @@ def _add_item(table: Table, item: ArticleViewItem, include_source: bool, include
     table.add_row(*row)
 
 
-def render_article_items(items: list[ArticleViewItem], mode: str) -> str:
+def render_article_items(
+    items: list[ArticleViewItem],
+    mode: str,
+    source_names: list[str] | None = None,
+) -> str:
     console = Console(
         force_terminal=True,
         color_system="standard",
         markup=False,
     )
     with console.capture() as capture:
-        if not items:
-            console.print("当天没有可展示的文章。")
-        elif mode == "source":
+        if mode == "source":
             grouped: dict[str, list[ArticleViewItem]] = defaultdict(list)
             for item in items:
                 grouped[item.source_name].append(item)
 
-            for index, source_name in enumerate(sorted(grouped.keys())):
+            names = sorted(set(source_names or grouped.keys()))
+            if not names:
+                console.print("当天没有可展示的文章。")
+            for index, source_name in enumerate(names):
                 if index > 0:
                     console.print()
                 console.print(source_name)
+                source_items = grouped.get(source_name, [])
+                if not source_items:
+                    console.print("当天无更新。")
+                    continue
                 table = _build_table(include_source=False, include_score=False)
-                for item in grouped[source_name]:
+                for item in source_items:
                     _add_item(table, item, include_source=False, include_score=False)
                 console.print(table)
         else:
+            if not items:
+                console.print("当天没有可展示的文章。")
+                return capture.get()
             include_score = mode == "recommend"
             table = _build_table(include_source=True, include_score=include_score)
             for item in items:

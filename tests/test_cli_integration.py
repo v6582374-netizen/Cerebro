@@ -26,6 +26,12 @@ def _fake_fetch(self, source_url: str, since):
     ]
 
 
+def _fake_fetch_partial(self, source_url: str, since):
+    if source_url.endswith("/gh_b"):
+        return []
+    return _fake_fetch(self, source_url, since)
+
+
 def _fake_probe(self, source_url: str):
     return True, None
 
@@ -73,6 +79,25 @@ def test_cli_view_modes_and_read_mark(isolated_env, monkeypatch):
     assert recommend_after_mark.exit_code == 0
     assert "[x]" in recommend_after_mark.stdout
     assert "AI: provider=" in recommend_after_mark.stdout
+
+
+def test_source_view_shows_all_subscriptions_even_without_updates(isolated_env, monkeypatch):
+    monkeypatch.setattr("wechat_agent.providers.template_feed_provider.TemplateFeedProvider.fetch", _fake_fetch_partial)
+    monkeypatch.setattr("wechat_agent.providers.template_feed_provider.TemplateFeedProvider.probe", _fake_probe)
+    monkeypatch.setattr(Summarizer, "summarize", _fake_summary)
+
+    add_a = runner.invoke(app, ["sub", "add", "--name", "号A", "--wechat-id", "gh_a"])
+    add_b = runner.invoke(app, ["sub", "add", "--name", "号B", "--wechat-id", "gh_b"])
+    assert add_a.exit_code == 0
+    assert add_b.exit_code == 0
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    out = runner.invoke(app, ["view", "--mode", "source", "--date", today, "--no-interactive"])
+    assert out.exit_code == 0
+    assert "号A" in out.stdout
+    assert "号B" in out.stdout
+    assert "当天无更新。" in out.stdout
+    assert "new=1" in out.stdout
 
 
 def test_cli_view_interactive_read_toggle(isolated_env, monkeypatch):
