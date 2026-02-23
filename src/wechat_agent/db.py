@@ -75,6 +75,12 @@ def _sqlite_auto_migrate(engine: Engine, db_url: str) -> None:
             "source_mode": "VARCHAR(32) NOT NULL DEFAULT 'auto'",
             "discovery_status": "VARCHAR(32) NOT NULL DEFAULT 'PENDING'",
         },
+        "sync_runs": {
+            "sync_batches": "INTEGER NOT NULL DEFAULT 0",
+            "official_msgs": "INTEGER NOT NULL DEFAULT 0",
+            "article_refs_extracted": "INTEGER NOT NULL DEFAULT 0",
+            "blocked_by_auth": "INTEGER NOT NULL DEFAULT 0",
+        },
     }
 
     with engine.begin() as conn:

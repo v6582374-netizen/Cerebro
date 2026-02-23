@@ -124,3 +124,77 @@ class CoverageReport:
     fail_subs: int
     coverage_ratio: float
     detail_json: str
+
+
+@dataclass(slots=True)
+class QrLoginSession:
+    uuid: str
+    qr_url: str
+    started_at: datetime
+
+
+@dataclass(slots=True)
+class AuthProgress:
+    status: str
+    code: int
+    redirect_uri: str | None = None
+    message: str | None = None
+
+
+@dataclass(slots=True)
+class WeChatSession:
+    base_uri: str
+    wxuin: str
+    sid: str
+    skey: str
+    pass_ticket: str
+    device_id: str
+    sync_key: dict
+    sync_host: str
+    cookies: dict[str, str]
+    expires_at: datetime
+    nickname: str | None = None
+
+
+@dataclass(slots=True)
+class OfficialAccount:
+    user_name: str
+    nick_name: str
+    verify_flag: int
+
+
+@dataclass(slots=True)
+class SyncBatch:
+    retcode: str
+    selector: str
+    messages: list[dict]
+    sync_key: dict
+    next_sync_host: str | None
+    created_at: datetime
+
+
+@dataclass(slots=True)
+class InboundMessagePayload:
+    msg_id: str
+    from_user_name: str
+    msg_type: int
+    app_msg_type: int
+    content: str
+    create_time: datetime
+
+
+@dataclass(slots=True)
+class ExtractedArticleRef:
+    url: str
+    title_hint: str | None
+    published_at_hint: datetime | None
+    from_user_name: str
+    msg_id: str
+
+
+@dataclass(slots=True)
+class BindResult:
+    ok: bool
+    official_user_name: str | None
+    confidence: float
+    reason: str

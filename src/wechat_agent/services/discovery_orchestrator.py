@@ -96,6 +96,18 @@ class DiscoveryOrchestrator:
                 except Exception:
                     pass
 
+    def get_runtime_metrics(self) -> dict[str, int]:
+        for provider in self.providers:
+            getter = getattr(provider, "get_last_metrics", None)
+            if callable(getter):
+                try:
+                    raw = getter()
+                    if isinstance(raw, dict):
+                        return {str(k): int(v) for k, v in raw.items()}
+                except Exception:
+                    continue
+        return {}
+
     def discover(
         self,
         session: Session,
@@ -192,6 +204,9 @@ class DiscoveryOrchestrator:
         target_date: date,
         session: Session,
     ) -> list[DiscoveredArticleRef]:
+        if provider.name == "wechat_web":
+            search_fn = getattr(provider, "search_for_subscription")
+            return search_fn(db=session, sub=sub, target_date=target_date)
         if provider.name == "weread":
             token = self.session_vault.get(self.session_provider)
             if token is None:
@@ -373,6 +388,10 @@ class DiscoveryOrchestrator:
     def _classify_discovery_error(self, exc: Exception) -> tuple[str, str]:
         text = str(exc)
         lowered = text.lower()
+        if "auth_required" in lowered:
+            return "AUTH_REQUIRED", text
+        if "sync_ret_error" in lowered:
+            return "SYNC_RET_ERROR", text
         if "auth_expired" in lowered or "登录态" in text:
             return "AUTH_EXPIRED", text
         if "timed out" in lowered or "timeout" in lowered:

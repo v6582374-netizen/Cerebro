@@ -85,6 +85,18 @@ class SyncService:
         self._refresh_low_quality_summaries(session=session, article_ids=new_article_ids)
         self.recommender.recompute_scores_for_date(session=session, target_date=target_date)
 
+        if self.discovery_orchestrator is not None:
+            metrics_getter = getattr(self.discovery_orchestrator, "get_runtime_metrics", None)
+            if callable(metrics_getter):
+                try:
+                    metrics = metrics_getter()
+                except Exception:
+                    metrics = {}
+                run.sync_batches = int(metrics.get("sync_batches", 0))
+                run.official_msgs = int(metrics.get("official_msgs", 0))
+                run.article_refs_extracted = int(metrics.get("article_refs_extracted", 0))
+                run.blocked_by_auth = int(metrics.get("blocked_by_auth", 0))
+
         run.finished_at = utcnow()
         return run
 
@@ -168,8 +180,9 @@ class SyncService:
             since=since,
         )
         cached_exists = self._has_cached_articles(session=session, sub=sub, day_start=day_start, day_end=day_end)
+        strict_fail_errors = {"AUTH_REQUIRED", "SYNC_RET_ERROR"}
         if not result.ok:
-            if cached_exists:
+            if cached_exists and (result.error_kind or "") not in strict_fail_errors:
                 sub.discovery_status = DISCOVERY_STATUS_DELAYED
                 sub.source_status = SOURCE_STATUS_MATCH_FAILED
                 sub.last_error = result.error_message

@@ -16,6 +16,7 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("DEFAULT_VIEW_MODE", "source")
     monkeypatch.setenv("WECHAT_AGENT_ENV_FILE", str(env_path))
     monkeypatch.setenv("DISCOVERY_V2_ENABLED", "false")
+    monkeypatch.setenv("WECHAT_WEB_ENABLED", "false")
     monkeypatch.setenv("SESSION_BACKEND", "file")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)

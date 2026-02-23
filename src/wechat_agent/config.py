@@ -43,12 +43,18 @@ class Settings:
     source_circuit_fail_threshold: int
     source_cooldown_minutes: int
     discovery_v2_enabled: bool
+    wechat_web_enabled: bool
+    wechat_web_base_url: str
+    strict_auth_required: bool
+    extreme_local_mode: bool
     session_provider: str
     session_backend: str
     coverage_sla_target: float
 
     def resolved_ai_provider(self) -> str:
         provider = self.ai_provider.strip().lower()
+        if self.extreme_local_mode and provider not in {"openai", "deepseek"}:
+            return "none"
         if provider in {"openai", "deepseek"}:
             return provider
         if self.openai_api_key:
@@ -187,7 +193,11 @@ def get_settings() -> Settings:
         source_circuit_fail_threshold=_to_int(os.getenv("SOURCE_CIRCUIT_FAIL_THRESHOLD"), 3),
         source_cooldown_minutes=_to_int(os.getenv("SOURCE_COOLDOWN_MINUTES"), 30),
         discovery_v2_enabled=_to_bool(os.getenv("DISCOVERY_V2_ENABLED"), True),
-        session_provider=os.getenv("SESSION_PROVIDER", "weread"),
+        wechat_web_enabled=_to_bool(os.getenv("WECHAT_WEB_ENABLED"), True),
+        wechat_web_base_url=os.getenv("WECHAT_WEB_BASE_URL", "https://wx.qq.com"),
+        strict_auth_required=_to_bool(os.getenv("STRICT_AUTH_REQUIRED"), True),
+        extreme_local_mode=_to_bool(os.getenv("EXTREME_LOCAL_MODE"), True),
+        session_provider=os.getenv("SESSION_PROVIDER", "wechat_web"),
         session_backend=os.getenv("SESSION_BACKEND", "auto"),
         coverage_sla_target=max(0.0, min(1.0, _to_float(os.getenv("COVERAGE_SLA_TARGET"), 0.95))),
     )

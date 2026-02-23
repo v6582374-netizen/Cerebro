@@ -29,6 +29,9 @@ DISCOVERY_STATUS_SUCCESS = "SUCCESS"
 DISCOVERY_STATUS_DELAYED = "DELAYED"
 DISCOVERY_STATUS_FAILED = "FAILED"
 
+BIND_STATUS_BOUND = "BOUND"
+BIND_STATUS_PENDING = "PENDING"
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -139,6 +142,10 @@ class SyncRun(Base):
     trigger: Mapped[str] = mapped_column(String(50), nullable=False)
     success_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     fail_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    sync_batches: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    official_msgs: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    article_refs_extracted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    blocked_by_auth: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     items: Mapped[list[SyncRunItem]] = relationship(back_populates="sync_run", cascade="all, delete")
 
@@ -224,6 +231,69 @@ class AuthSessionEntry(Base):
     provider: Mapped[str] = mapped_column(String(64), primary_key=True)
     encrypted_blob: Mapped[str] = mapped_column(Text, nullable=False)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class WeChatAccount(Base):
+    __tablename__ = "wechat_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    wxuin: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    nickname: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ACTIVE")
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class WeChatSyncState(Base):
+    __tablename__ = "wechat_sync_states"
+
+    account_id: Mapped[int] = mapped_column(ForeignKey("wechat_accounts.id", ondelete="CASCADE"), primary_key=True)
+    sync_key_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    sync_host: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_selector: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class OfficialAccountEntry(Base):
+    __tablename__ = "official_accounts"
+    __table_args__ = (UniqueConstraint("account_id", "user_name", name="uq_official_account_user"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("wechat_accounts.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    nick_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    verify_flag: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
+
+
+class InboundMessageEntry(Base):
+    __tablename__ = "inbound_messages"
+    __table_args__ = (UniqueConstraint("account_id", "msg_id", name="uq_inbound_msg"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("wechat_accounts.id", ondelete="CASCADE"), nullable=False, index=True)
+    msg_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    from_user_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    msg_type: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    app_msg_type: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    create_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+
+class SubscriptionBinding(Base):
+    __tablename__ = "subscription_bindings"
+
+    subscription_id: Mapped[int] = mapped_column(
+        ForeignKey("subscriptions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    official_user_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    bind_status: Mapped[str] = mapped_column(String(32), nullable=False, default=BIND_STATUS_BOUND)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow)
 
 

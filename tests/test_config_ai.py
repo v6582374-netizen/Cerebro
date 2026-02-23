@@ -5,6 +5,7 @@ from wechat_agent.config import DEFAULT_OPENAI_BASE_URL, get_settings
 
 def test_resolve_deepseek_auto(monkeypatch):
     monkeypatch.setenv("AI_PROVIDER", "auto")
+    monkeypatch.setenv("EXTREME_LOCAL_MODE", "false")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test-key")
     monkeypatch.setenv("DEEPSEEK_CHAT_MODEL", "deepseek-chat")
@@ -23,6 +24,7 @@ def test_resolve_deepseek_auto(monkeypatch):
 
 def test_resolve_openai_priority(monkeypatch):
     monkeypatch.setenv("AI_PROVIDER", "openai")
+    monkeypatch.setenv("EXTREME_LOCAL_MODE", "false")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-test-key")
     monkeypatch.setenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
     monkeypatch.setenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
@@ -40,6 +42,7 @@ def test_resolve_openai_priority(monkeypatch):
 
 def test_default_openai_base_url(monkeypatch, tmp_path):
     monkeypatch.setenv("WECHAT_AGENT_ENV_FILE", str(tmp_path / ".env"))
+    monkeypatch.setenv("EXTREME_LOCAL_MODE", "false")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)

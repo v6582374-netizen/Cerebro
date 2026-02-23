@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from enum import Enum
 import hashlib
 import json
+import time
 from pathlib import Path
 import re
 import sys
@@ -13,7 +14,7 @@ import webbrowser
 import typer
 from rich.console import Console
 from rich.table import Table
-from sqlalchemy import and_, case, delete, func, select
+from sqlalchemy import and_, case, func, select
 
 from .config import (
     DEFAULT_DEEPSEEK_BASE_URL,
@@ -33,6 +34,7 @@ from .models import (
     DiscoveryRun,
     FETCH_STATUS_FAILED,
     FetchAttempt,
+    OfficialAccountEntry,
     ReadState,
     RecommendationScoreEntry,
     SOURCE_STATUS_ACTIVE,
@@ -42,8 +44,10 @@ from .models import (
     SYNC_ITEM_STATUS_SUCCESS,
     SyncRun,
     SyncRunItem,
+    WeChatAccount,
     utcnow,
 )
+from .providers.wechat_web_discovery_provider import WeChatWebDiscoveryProvider
 from .providers.search_index_provider import SearchIndexProvider
 from .providers.template_feed_provider import TemplateFeedProvider
 from .providers.wechat2rss_discovery_provider import Wechat2RssDiscoveryProvider
@@ -55,6 +59,8 @@ from .services.fetcher import Fetcher
 from .services.read_state import ReadStateService
 from .services.recommender import Recommender
 from .services.session_vault import SessionVault
+from .services.subscription_binder import SubscriptionBinder
+from .services.wechat_web_client import WeChatWebAuthClient
 from .services.source_gateway import (
     ManualSourceProvider,
     SourceGateway,
@@ -74,9 +80,13 @@ app = typer.Typer(help="微信公众号文章 CLI 聚合推荐系统", no_args_i
 sub_app = typer.Typer(help="订阅管理")
 read_app = typer.Typer(help="阅读状态管理")
 config_app = typer.Typer(help="配置管理")
+auth_app = typer.Typer(help="微信登录态管理")
+security_app = typer.Typer(help="安全检查")
 app.add_typer(sub_app, name="sub")
 app.add_typer(read_app, name="read")
 app.add_typer(config_app, name="config")
+app.add_typer(auth_app, name="auth")
+app.add_typer(security_app, name="security")
 
 
 class ViewMode(str, Enum):
@@ -135,7 +145,22 @@ def _build_runtime():
     discovery_orchestrator: DiscoveryOrchestrator | None = None
     source_gateway: SourceGateway | None = None
     closers: list[object] = [provider]
-    if settings.discovery_v2_enabled:
+    if settings.wechat_web_enabled:
+        session_vault = SessionVault(backend=settings.session_backend)
+        wechat_web_provider = WeChatWebDiscoveryProvider(
+            session_vault=session_vault,
+            session_provider=settings.session_provider,
+            timeout_seconds=settings.http_timeout_seconds,
+        )
+        discovery_orchestrator = DiscoveryOrchestrator(
+            providers=[wechat_web_provider],
+            session_vault=session_vault,
+            session_provider=settings.session_provider,
+            timeout_seconds=settings.http_timeout_seconds,
+            midnight_shift_days=settings.midnight_shift_days,
+        )
+        closers.append(discovery_orchestrator)
+    elif settings.discovery_v2_enabled:
         session_vault = SessionVault(backend=settings.session_backend)
         discovery_orchestrator = DiscoveryOrchestrator(
             providers=[
@@ -828,6 +853,11 @@ def status() -> None:
         typer.echo(
             f"最近同步 #{run.id} | 触发方式: {run.trigger} | 成功: {run.success_count} | 失败: {run.fail_count}"
         )
+        typer.echo(
+            "微信同步指标: "
+            f"sync_batches={run.sync_batches}, official_msgs={run.official_msgs}, "
+            f"article_refs_extracted={run.article_refs_extracted}, blocked_by_auth={run.blocked_by_auth}"
+        )
         typer.echo(f"session_state={_session_state(session=session, settings=settings)}")
         new_total, no_new_sources = _sync_run_new_stats(session=session, run_id=run.id)
         typer.echo(f"新增文章: {new_total}")
@@ -881,50 +911,116 @@ def status() -> None:
 
 @app.command("login")
 def login(
-    provider: str = typer.Option("weread", "--provider"),
-    token: str | None = typer.Option(None, "--token", help="登录态Cookie，可留空进入安全输入"),
-    expires_days: int = typer.Option(30, "--expires-days", min=1, max=365),
+    provider: str = typer.Option("wechat_web", "--provider"),
+    open_browser: bool = typer.Option(True, "--open-browser/--no-open-browser"),
+    timeout_seconds: int = typer.Option(120, "--timeout", min=30, max=600),
 ) -> None:
-    """保存本地登录态（仅本机，不上传）。"""
+    """通过二维码扫码登录微信网页版并保存本地会话。"""
 
     settings = get_settings()
     init_db(settings)
     provider_name = provider.strip().lower() or settings.session_provider
-    raw_token = token
-    if raw_token is None:
-        raw_token = typer.prompt("请输入登录态Cookie", hide_input=True)
-    if provider_name == "weread":
-        raw_token = WeReadDiscoveryProvider.parse_token_from_input(raw_token)
-    secret = (raw_token or "").strip()
-    if not secret:
-        typer.echo("登录态为空，未保存。")
+    if provider_name != "wechat_web":
+        typer.echo("V3 仅支持 `--provider wechat_web` 扫码登录。")
         _echo_ai_footer(settings)
         return
 
+    client = WeChatWebAuthClient(
+        base_url=settings.wechat_web_base_url,
+        timeout_seconds=settings.http_timeout_seconds,
+    )
+    try:
+        qr = client.start()
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"登录初始化失败: {exc}")
+        _echo_ai_footer(settings)
+        return
+
+    typer.echo("请在手机微信中扫码登录。")
+    typer.echo(f"二维码链接: {qr.qr_url}")
+    if open_browser:
+        webbrowser.open(qr.qr_url, new=2)
+    typer.echo("等待扫码中（超时会自动退出）...")
+
+    progress = None
+    status_note = ""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            progress = client.poll(qr)
+        except Exception as exc:  # noqa: BLE001
+            typer.echo(f"轮询扫码状态失败: {exc}")
+            _echo_ai_footer(settings)
+            client.close()
+            return
+        if progress.status == "scanned" and status_note != "scanned":
+            typer.echo("已扫码，请在手机微信点击确认登录。")
+            status_note = "scanned"
+        if progress.status == "confirmed":
+            break
+        if progress.status in {"expired", "failed"}:
+            typer.echo(progress.message or "二维码登录失败，请重试。")
+            _echo_ai_footer(settings)
+            client.close()
+            return
+        time.sleep(2)
+
+    if progress is None or progress.status != "confirmed":
+        typer.echo("扫码登录超时，请重新执行 `wechat-agent login`。")
+        _echo_ai_footer(settings)
+        client.close()
+        return
+
+    try:
+        sess = client.finish(progress)
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"登录完成失败: {exc}")
+        _echo_ai_footer(settings)
+        client.close()
+        return
+    finally:
+        client.close()
+
+    serialized = WeChatWebAuthClient.serialize_session(sess)
     vault = SessionVault(backend=settings.session_backend)
     try:
-        vault.set(provider_name, secret)
+        vault.set(provider_name, serialized)
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"保存登录态失败: {exc}")
         _echo_ai_footer(settings)
         return
 
-    expires_at = utcnow() + timedelta(days=expires_days)
+    expires_at = sess.expires_at
     with session_scope(settings) as session:
         _upsert_auth_session(
             session=session,
             provider=provider_name,
-            secret=secret,
+            secret=serialized,
             expires_at=expires_at,
         )
+        account = session.scalar(select(WeChatAccount).where(WeChatAccount.wxuin == sess.wxuin))
+        if account is None:
+            session.add(
+                WeChatAccount(
+                    wxuin=sess.wxuin,
+                    nickname=sess.nickname,
+                    status="ACTIVE",
+                    last_login_at=utcnow(),
+                    last_sync_at=None,
+                )
+            )
+        else:
+            account.nickname = sess.nickname or account.nickname
+            account.status = "ACTIVE"
+            account.last_login_at = utcnow()
         session.commit()
-    typer.echo(f"登录态已保存: provider={provider_name}, expires_at={expires_at.isoformat()}")
+    typer.echo(f"登录成功: provider={provider_name}, wxuin={sess.wxuin}, expires_at={expires_at.isoformat()}")
     _echo_ai_footer(settings)
 
 
 @app.command("logout")
 def logout(
-    provider: str = typer.Option("weread", "--provider"),
+    provider: str = typer.Option("wechat_web", "--provider"),
 ) -> None:
     """删除本地登录态。"""
 
@@ -942,8 +1038,33 @@ def logout(
         row = session.get(AuthSessionEntry, provider_name)
         if row is not None:
             session.delete(row)
-            session.commit()
+        account_rows = session.scalars(select(WeChatAccount)).all()
+        for account in account_rows:
+            account.status = "LOGGED_OUT"
+        session.commit()
     typer.echo(f"登录态已删除: provider={provider_name}")
+    _echo_ai_footer(settings)
+
+
+@auth_app.command("status")
+def auth_status(
+    provider: str = typer.Option("wechat_web", "--provider"),
+) -> None:
+    """查看当前登录态状态。"""
+    settings = get_settings()
+    init_db(settings)
+    provider_name = provider.strip().lower() or settings.session_provider
+    with session_scope(settings) as session:
+        state = _session_state(session=session, settings=settings)
+        auth_row = session.get(AuthSessionEntry, provider_name)
+        account = session.scalar(select(WeChatAccount).order_by(WeChatAccount.updated_at.desc()).limit(1))
+        expires_at = auth_row.expires_at.isoformat() if auth_row and auth_row.expires_at else "-"
+        last_sync = account.last_sync_at.isoformat() if account and account.last_sync_at else "-"
+        wxuin = account.wxuin if account else "-"
+        typer.echo(
+            f"auth_status: provider={provider_name}, state={state}, wxuin={wxuin}, "
+            f"expires_at={expires_at}, last_sync_at={last_sync}, risk_backoff=none"
+        )
     _echo_ai_footer(settings)
 
 
@@ -1002,6 +1123,27 @@ def coverage(
                     typer.echo(f"- {error_kind}: {count}")
         if report.coverage_ratio < settings.coverage_sla_target:
             typer.echo("告警: 覆盖率低于SLA阈值，请检查登录态与发现通道可用性。")
+    _echo_ai_footer(settings)
+
+
+@security_app.command("check")
+def security_check() -> None:
+    """输出当前本地安全模式检查结果。"""
+    settings = get_settings()
+    init_db(settings)
+    with session_scope(settings) as session:
+        state = _session_state(session=session, settings=settings)
+        host_allowlist = [
+            "wx.qq.com",
+            "web.wechat.com",
+            "login.wx.qq.com",
+            "mp.weixin.qq.com",
+        ]
+        typer.echo(f"extreme_local_mode={settings.extreme_local_mode}")
+        typer.echo(f"session_backend={settings.session_backend}")
+        typer.echo(f"session_state={state}")
+        typer.echo(f"remote_ai_enabled={not settings.extreme_local_mode}")
+        typer.echo(f"network_allowlist={','.join(host_allowlist)}")
     _echo_ai_footer(settings)
 
 
@@ -1087,6 +1229,10 @@ def config_show() -> None:
     typer.echo(f"DEEPSEEK_BASE_URL={deepseek_base}")
     typer.echo(f"DEEPSEEK_API_KEY={_mask_secret(current.get('DEEPSEEK_API_KEY'))}")
     typer.echo(f"DISCOVERY_V2_ENABLED={settings.discovery_v2_enabled}")
+    typer.echo(f"WECHAT_WEB_ENABLED={settings.wechat_web_enabled}")
+    typer.echo(f"WECHAT_WEB_BASE_URL={settings.wechat_web_base_url}")
+    typer.echo(f"STRICT_AUTH_REQUIRED={settings.strict_auth_required}")
+    typer.echo(f"EXTREME_LOCAL_MODE={settings.extreme_local_mode}")
     typer.echo(f"SESSION_PROVIDER={settings.session_provider}")
     typer.echo(f"SESSION_BACKEND={settings.session_backend}")
     typer.echo(f"COVERAGE_SLA_TARGET={settings.coverage_sla_target:.2f}")
@@ -1098,7 +1244,7 @@ def sub_add(
     name: str = typer.Option(..., "--name"),
     wechat_id: str | None = typer.Option(None, "--wechat-id"),
 ) -> None:
-    """新增订阅（V2: 仅需公众号名，系统自动发现）。"""
+    """新增订阅（V3: 仅需公众号名，自动尝试绑定官方号）。"""
 
     settings = get_settings()
     init_db(settings)
@@ -1127,10 +1273,44 @@ def sub_add(
         session.flush()
 
         discovery_note = ""
-        if settings.discovery_v2_enabled:
+        if settings.wechat_web_enabled:
+            binder = SubscriptionBinder()
+            result = binder.auto_bind(session=session, sub=sub)
+            if result.ok and result.official_user_name:
+                sub.discovery_status = DISCOVERY_STATUS_SUCCESS
+                sub.source_status = SOURCE_STATUS_ACTIVE
+                sub.last_error = None
+                discovery_note = f"自动绑定成功: {result.official_user_name}"
+            else:
+                candidates = binder.find_candidates(session=session, subscription_name=sub.name)
+                if len(candidates) > 1 and sys.stdin.isatty() and sys.stdout.isatty():
+                    typer.echo("发现多个可能匹配的官方号，请选择：")
+                    top = candidates[:5]
+                    for idx, (user_name, nick_name, score) in enumerate(top, start=1):
+                        typer.echo(f"{idx}. {nick_name} ({user_name}) score={score:.2f}")
+                    raw = typer.prompt("输入编号(0跳过绑定)", default="1").strip()
+                    try:
+                        picked = int(raw)
+                    except ValueError:
+                        picked = 0
+                    if 1 <= picked <= len(top):
+                        user_name = top[picked - 1][0]
+                        binder.bind(session=session, sub=sub, official_user_name=user_name, confidence=top[picked - 1][2])
+                        sub.discovery_status = DISCOVERY_STATUS_SUCCESS
+                        sub.source_status = SOURCE_STATUS_ACTIVE
+                        sub.last_error = None
+                        discovery_note = f"已手动选择绑定: {user_name}"
+                    else:
+                        sub.last_error = "BIND_PENDING: 请执行 sub bind 完成绑定"
+                        discovery_note = "未完成绑定，后续可执行 `wechat-agent sub bind`。"
+                else:
+                    sub.last_error = "BIND_PENDING: 请执行 sub bind 完成绑定"
+                    discovery_note = "暂未自动绑定成功，后续可执行 `wechat-agent sub bind`。"
+        elif settings.discovery_v2_enabled:
             orchestrator = DiscoveryOrchestrator(
                 providers=[
                     WeReadDiscoveryProvider(timeout_seconds=settings.http_timeout_seconds),
+                    Wechat2RssDiscoveryProvider(timeout_seconds=settings.http_timeout_seconds),
                     SearchIndexProvider(timeout_seconds=settings.http_timeout_seconds),
                 ],
                 session_vault=SessionVault(backend=settings.session_backend),
@@ -1167,12 +1347,6 @@ def sub_add(
                         sub.last_error = "PENDING_DISCOVERY: 候选未确认"
                         discovery_note = "已创建订阅，暂未确认候选，后续 view 会继续自动发现。"
                     else:
-                        session.execute(
-                            delete(ArticleRef).where(
-                                ArticleRef.subscription_id == sub.id,
-                                ArticleRef.url != selected.url,
-                            )
-                        )
                         chosen = session.scalar(
                             select(ArticleRef).where(
                                 ArticleRef.subscription_id == sub.id,
@@ -1232,6 +1406,35 @@ def sub_remove(wechat_id: str = typer.Option(..., "--wechat-id")) -> None:
     _echo_ai_footer(settings)
 
 
+@sub_app.command("bind")
+def sub_bind(
+    name: str = typer.Option(..., "--name"),
+    account: str = typer.Option(..., "--account", help="官方号UserName，例如 gh_xxx"),
+) -> None:
+    """手动绑定订阅与微信官方号标识。"""
+    settings = get_settings()
+    init_db(settings)
+    with session_scope(settings) as session:
+        sub = session.scalar(select(Subscription).where(Subscription.name == name))
+        if sub is None:
+            typer.echo(f"未找到订阅: {name}")
+            _echo_ai_footer(settings)
+            return
+        official = session.scalar(select(OfficialAccountEntry).where(OfficialAccountEntry.user_name == account))
+        if official is None:
+            typer.echo(f"未找到官方号记录: {account}。请先执行一次 `wechat-agent view` 同步联系人。")
+            _echo_ai_footer(settings)
+            return
+        binder = SubscriptionBinder()
+        binder.bind(session=session, sub=sub, official_user_name=account, confidence=1.0)
+        sub.discovery_status = DISCOVERY_STATUS_SUCCESS
+        sub.source_status = SOURCE_STATUS_ACTIVE
+        sub.last_error = None
+        session.commit()
+        typer.echo(f"绑定成功: {name} -> {account}")
+    _echo_ai_footer(settings)
+
+
 @app.command("view")
 def view(
     mode: ViewMode | None = typer.Option(None, "--mode", help="source/time/recommend"),
@@ -1247,6 +1450,14 @@ def view(
 
     settings = get_settings()
     init_db(settings)
+
+    if settings.wechat_web_enabled and settings.strict_auth_required:
+        with session_scope(settings) as session:
+            state = _session_state(session=session, settings=settings)
+        if state != "valid":
+            typer.echo("当前登录态无效，无法执行同步。请先执行 `wechat-agent login` 完成扫码登录。")
+            _echo_ai_footer(settings)
+            return
 
     mode_value = (mode.value if mode else settings.default_view_mode).lower()
     if mode_value not in {"source", "time", "recommend"}:
