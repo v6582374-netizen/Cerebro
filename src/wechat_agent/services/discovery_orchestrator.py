@@ -107,14 +107,17 @@ class DiscoveryOrchestrator:
         last_error_kind = "SEARCH_EMPTY"
         last_error_message = "未发现文章链接"
         all_refs: list[DiscoveredArticleRef] = []
+        provider_notes: list[str] = []
 
         for provider in self.providers:
             try:
                 refs = self._search_with_provider(provider=provider, sub=sub, target_date=target_date, session=session)
             except Exception as exc:  # noqa: BLE001
                 last_error_kind, last_error_message = self._classify_discovery_error(exc)
+                provider_notes.append(f"{provider.name}=error({last_error_kind})")
                 continue
             filtered = [ref for ref in refs if ref.url]
+            provider_notes.append(f"{provider.name}={len(filtered)}")
             if filtered:
                 all_refs = filtered
                 break
@@ -123,15 +126,20 @@ class DiscoveryOrchestrator:
             history_refs = self._history_backtrack_refs(session=session, sub=sub, target_date=target_date)
             if history_refs:
                 all_refs = history_refs
+                provider_notes.append(f"history_backtrack={len(history_refs)}")
+            else:
+                provider_notes.append("history_backtrack=0")
 
         if not all_refs:
             latency_ms = int((time.perf_counter() - started) * 1000)
+            note_text = ", ".join(provider_notes)
+            error_message = last_error_message if not note_text else f"{last_error_message} ({note_text})"
             return DiscoveryResult(
                 ok=False,
                 refs=[],
                 channel_used=None,
                 error_kind=last_error_kind,
-                error_message=last_error_message,
+                error_message=error_message,
                 latency_ms=latency_ms,
                 status="FAILED",
             )
@@ -192,8 +200,12 @@ class DiscoveryOrchestrator:
             return search_fn(sub.name, target_date, token)
         if provider.name == "search_index":
             search_fn = getattr(provider, "search")
+            extra_keywords: list[str] = []
+            wechat_id = (sub.wechat_id or "").strip()
+            if wechat_id and not wechat_id.startswith("auto_"):
+                extra_keywords.append(wechat_id)
             try:
-                return search_fn(sub.name, target_date, extra_keywords=[sub.wechat_id])
+                return search_fn(sub.name, target_date, extra_keywords=extra_keywords)
             except TypeError:
                 return search_fn(sub.name, target_date)
         search_fn = getattr(provider, "search")

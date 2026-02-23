@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-import html
 from html.parser import HTMLParser
 import re
+import time
 from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
@@ -18,10 +18,30 @@ _MP_LINK_RE = re.compile(r"https?://mp\.weixin\.qq\.com/s\?[^\s\"'<>]+", re.IGNO
 _MP_LINK_ESCAPED_RE = re.compile(r"https:\\/\\/mp\\.weixin\\.qq\\.com\\/s\\?[^\s\"'<>]+", re.IGNORECASE)
 
 
+def _keyword_tokens(text: str) -> list[str]:
+    value = (text or "").strip()
+    if not value:
+        return []
+    tokens = re.findall(r"[\u4e00-\u9fff]+|[A-Za-z0-9_]+", value)
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        cleaned = token.strip()
+        if len(cleaned) < 2:
+            continue
+        lowered = cleaned.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        out.append(cleaned)
+    return out
+
+
 def _normalize_mp_link(raw: str) -> str | None:
     if not raw:
         return None
-    href = html.unescape(raw).strip().rstrip(").,;]")
+    href = raw.strip().rstrip(").,;]")
+    href = href.replace("&amp;", "&").replace("&#38;", "&")
     href = href.replace("\\u002F", "/").replace("\\/", "/")
     if href.startswith("//"):
         href = f"https:{href}"
@@ -42,7 +62,7 @@ def _normalize_mp_link(raw: str) -> str | None:
 def _extract_mp_links_from_text(raw_text: str) -> list[str]:
     if not raw_text:
         return []
-    text = html.unescape(raw_text)
+    text = raw_text.replace("&amp;", "&").replace("&#38;", "&")
     extracted: list[str] = []
     for match in _MP_LINK_RE.findall(text):
         extracted.append(match)
@@ -117,19 +137,27 @@ class SearchIndexProvider:
                 keywords.append(cleaned)
 
         queries: list[str] = []
-        for keyword in keywords:
-            queries.extend(
-                [
-                    f'site:mp.weixin.qq.com "{keyword}"',
-                    f'site:mp.weixin.qq.com/s "{keyword}"',
-                    f'"{keyword}" 微信公众号',
-                ]
-            )
-        queries.append(f'site:mp.weixin.qq.com "{subscription_name}" {target_date.isoformat()}')
+        primary = keywords[0]
+        queries.append(f'site:mp.weixin.qq.com "{primary}"')
+        primary_tokens = _keyword_tokens(primary)
+        for token in primary_tokens[:2]:
+            if token != primary:
+                queries.append(f'site:mp.weixin.qq.com "{token}"')
+        if len(keywords) > 1:
+            queries.append(f'site:mp.weixin.qq.com "{keywords[1]}"')
+        queries.append(f'"{primary}" "mp.weixin.qq.com/s?"')
+        queries.append(f'site:mp.weixin.qq.com "{primary}" {target_date.isoformat()}')
+        dedup_queries: list[str] = []
+        seen_queries: set[str] = set()
+        for item in queries:
+            if item in seen_queries:
+                continue
+            seen_queries.add(item)
+            dedup_queries.append(item)
 
         refs: list[DiscoveredArticleRef] = []
         seen: set[str] = set()
-        for query_index, query in enumerate(queries):
+        for query_index, query in enumerate(dedup_queries[:2]):
             if len(refs) >= limit:
                 break
             query_factor = max(0.6, 1.0 - (query_index * 0.08))
@@ -148,11 +176,19 @@ class SearchIndexProvider:
         seen: set[str] = set()
 
         engines = (
-            ("duckduckgo", "https://duckduckgo.com/html/", 0.85),
-            ("bing", "https://www.bing.com/search", 0.75),
+            ("brave", "https://search.brave.com/search", "q", 0.95),
+            ("sogou_web", "https://www.sogou.com/web", "query", 0.90),
+            ("duckduckgo", "https://duckduckgo.com/html/", "q", 0.80),
+            ("bing", "https://www.bing.com/search", "q", 0.70),
         )
-        for _engine_name, endpoint, base_conf in engines:
-            html_text = self._fetch_engine_html(endpoint=endpoint, query=query)
+        for engine_name, endpoint, query_key, base_conf in engines:
+            html_text = self._fetch_engine_html(
+                endpoint=endpoint,
+                query=query,
+                query_key=query_key,
+                engine_name=engine_name,
+            )
+            time.sleep(0.15)
             if not html_text:
                 continue
 
@@ -211,19 +247,33 @@ class SearchIndexProvider:
                 break
         return refs
 
-    def _fetch_engine_html(self, endpoint: str, query: str) -> str:
+    def _fetch_engine_html(self, endpoint: str, query: str, query_key: str, engine_name: str) -> str:
         try:
             response = self.client.get(
                 endpoint,
-                params={"q": query},
+                params={query_key: query},
                 headers={
                     "User-Agent": _UA,
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+                    "Referer": (
+                        "https://www.sogou.com/"
+                        if engine_name == "sogou_web"
+                        else ("https://search.brave.com/" if engine_name == "brave" else "https://www.bing.com/")
+                    ),
                 },
             )
             response.raise_for_status()
-            return response.text
+            text = response.text
+            lowered_url = str(response.url).lower()
+            lowered_text = text.lower()
+            if "antispider" in lowered_url or "antispider" in lowered_text:
+                return ""
+            if "too many requests" in lowered_text or "rate limit" in lowered_text:
+                return ""
+            if "captcha" in lowered_text and "mp.weixin.qq.com" not in lowered_text:
+                return ""
+            return text
         except Exception:
             return ""
 

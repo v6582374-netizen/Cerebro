@@ -46,6 +46,7 @@ from .models import (
 )
 from .providers.search_index_provider import SearchIndexProvider
 from .providers.template_feed_provider import TemplateFeedProvider
+from .providers.wechat2rss_discovery_provider import Wechat2RssDiscoveryProvider
 from .providers.weread_discovery_provider import WeReadDiscoveryProvider
 from .schemas import ArticleViewItem, DiscoveredArticleRef
 from .services.coverage_service import CoverageService
@@ -139,6 +140,7 @@ def _build_runtime():
         discovery_orchestrator = DiscoveryOrchestrator(
             providers=[
                 WeReadDiscoveryProvider(timeout_seconds=settings.http_timeout_seconds),
+                Wechat2RssDiscoveryProvider(timeout_seconds=settings.http_timeout_seconds),
                 SearchIndexProvider(timeout_seconds=settings.http_timeout_seconds),
             ],
             session_vault=session_vault,
