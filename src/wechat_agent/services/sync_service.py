@@ -14,6 +14,7 @@ from ..models import (
     SYNC_ITEM_STATUS_FAILED,
     SYNC_ITEM_STATUS_SUCCESS,
     Subscription,
+    SubscriptionSource,
     SyncRun,
     SyncRunItem,
     utcnow,
@@ -22,6 +23,7 @@ from ..schemas import RawArticle
 from ..time_utils import local_day_bounds_utc
 from .fetcher import Fetcher
 from .recommender import Recommender
+from .source_gateway import MANUAL_PROVIDER, SourceGateway
 from .source_resolver import SourceResolver
 from .summarizer import Summarizer
 
@@ -35,6 +37,7 @@ class SyncService:
         recommender: Recommender,
         sync_overlap_seconds: int = 120,
         incremental_sync_enabled: bool = True,
+        source_gateway: SourceGateway | None = None,
     ) -> None:
         self.resolver = resolver
         self.fetcher = fetcher
@@ -42,6 +45,7 @@ class SyncService:
         self.recommender = recommender
         self.sync_overlap_seconds = max(sync_overlap_seconds, 0)
         self.incremental_sync_enabled = incremental_sync_enabled
+        self.source_gateway = source_gateway
 
     def sync(self, session: Session, target_date: date, trigger: str = "view") -> SyncRun:
         run = SyncRun(trigger=trigger, started_at=utcnow(), success_count=0, fail_count=0)
@@ -104,6 +108,31 @@ class SyncService:
         since: datetime,
         new_article_ids: list[int],
     ) -> None:
+        if self.source_gateway is not None:
+            self._sync_subscription_v2(
+                session=session,
+                run=run,
+                sub=sub,
+                since=since,
+                new_article_ids=new_article_ids,
+            )
+            return
+        self._sync_subscription_v1(
+            session=session,
+            run=run,
+            sub=sub,
+            since=since,
+            new_article_ids=new_article_ids,
+        )
+
+    def _sync_subscription_v1(
+        self,
+        session: Session,
+        run: SyncRun,
+        sub: Subscription,
+        since: datetime,
+        new_article_ids: list[int],
+    ) -> None:
         result = self.resolver.resolve(sub)
         if not result.ok or not result.source_url:
             sub.source_status = SOURCE_STATUS_MATCH_FAILED
@@ -140,6 +169,66 @@ class SyncService:
             )
             return
 
+        self._record_success_items(
+            session=session,
+            run=run,
+            sub=sub,
+            raw_articles=raw_articles,
+            new_article_ids=new_article_ids,
+        )
+
+    def _sync_subscription_v2(
+        self,
+        session: Session,
+        run: SyncRun,
+        sub: Subscription,
+        since: datetime,
+        new_article_ids: list[int],
+    ) -> None:
+        fetch_result = self.source_gateway.fetch_with_failover(
+            session=session,
+            sync_run_id=run.id,
+            sub=sub,
+            since=since,
+        )
+        if not fetch_result.ok or not fetch_result.candidate.url:
+            sub.source_status = SOURCE_STATUS_MATCH_FAILED
+            sub.last_error = fetch_result.error_message or "未匹配到可用公开源"
+            run.fail_count += 1
+            session.add(
+                SyncRunItem(
+                    sync_run_id=run.id,
+                    subscription_id=sub.id,
+                    status=SYNC_ITEM_STATUS_FAILED,
+                    new_count=0,
+                    error_message=f"{fetch_result.error_kind or 'UNKNOWN'}: {sub.last_error}",
+                )
+            )
+            return
+
+        sub.source_url = fetch_result.candidate.url
+        sub.preferred_provider = fetch_result.candidate.provider
+        sub.source_status = SOURCE_STATUS_ACTIVE
+        sub.last_error = None
+
+        # Keep legacy source_url compatible by mirroring it as a pinned manual source.
+        self._ensure_manual_legacy_source(session=session, sub=sub)
+        self._record_success_items(
+            session=session,
+            run=run,
+            sub=sub,
+            raw_articles=fetch_result.articles,
+            new_article_ids=new_article_ids,
+        )
+
+    def _record_success_items(
+        self,
+        session: Session,
+        run: SyncRun,
+        sub: Subscription,
+        raw_articles: list[RawArticle],
+        new_article_ids: list[int],
+    ) -> None:
         new_count = 0
         for raw in raw_articles:
             article_id = self._upsert_article(session=session, sub=sub, raw=raw)
@@ -170,7 +259,6 @@ class SyncService:
             published_at = raw.published_at
             if published_at.tzinfo is None:
                 published_at = published_at.replace(tzinfo=timezone.utc)
-            # Keep historical records aligned with current publish-time normalization rules.
             if existing.published_at != published_at:
                 existing.published_at = published_at
             if (raw.content_excerpt or "") and existing.content_excerpt != raw.content_excerpt:
@@ -261,8 +349,32 @@ class SyncService:
             return True
         if compact.endswith(("…", "...", "..", "，", ",", "、", "；", ";", "：", ":")):
             return True
-        # Fallback summaries are often direct snippets; near-limit snippet tails are likely truncated.
         if (model or "").strip().lower() == "fallback":
             if len(compact) >= 48 and compact[-1] not in {"。", "！", "？", "!", "?"}:
                 return True
         return False
+
+    def _ensure_manual_legacy_source(self, session: Session, sub: Subscription) -> None:
+        if not sub.source_url:
+            return
+        existing = session.scalar(
+            select(SubscriptionSource).where(
+                SubscriptionSource.subscription_id == sub.id,
+                SubscriptionSource.provider == MANUAL_PROVIDER,
+                SubscriptionSource.source_url == sub.source_url,
+            )
+        )
+        if existing is not None:
+            return
+        session.add(
+            SubscriptionSource(
+                subscription_id=sub.id,
+                provider=MANUAL_PROVIDER,
+                source_url=sub.source_url,
+                priority=0,
+                is_pinned=True,
+                is_active=True,
+                confidence=1.0,
+                metadata_json='{"legacy":true}',
+            )
+        )

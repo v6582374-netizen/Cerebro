@@ -23,21 +23,37 @@ from .db import init_db, session_scope
 from .models import (
     Article,
     ArticleSummary,
+    FETCH_STATUS_FAILED,
+    FetchAttempt,
+    HEALTH_STATE_OPEN,
     ReadState,
     RecommendationScoreEntry,
     SOURCE_STATUS_ACTIVE,
     SOURCE_STATUS_PENDING,
+    SourceHealth,
     Subscription,
+    SubscriptionSource,
     SYNC_ITEM_STATUS_FAILED,
     SYNC_ITEM_STATUS_SUCCESS,
     SyncRun,
     SyncRunItem,
+    utcnow,
 )
 from .providers.template_feed_provider import TemplateFeedProvider
 from .schemas import ArticleViewItem
 from .services.fetcher import Fetcher
 from .services.read_state import ReadStateService
 from .services.recommender import Recommender
+from .services.source_gateway import (
+    MANUAL_PROVIDER,
+    ManualSourceProvider,
+    SourceGateway,
+    SourceHealthService,
+    SourceRouter,
+    TemplateMirrorSourceProvider,
+    Wechat2RssIndexProvider,
+    stale_hours,
+)
 from .services.source_resolver import SourceResolver
 from .services.summarizer import Summarizer
 from .services.sync_service import SyncService
@@ -48,9 +64,11 @@ app = typer.Typer(help="微信公众号文章 CLI 聚合推荐系统", no_args_i
 sub_app = typer.Typer(help="订阅管理")
 read_app = typer.Typer(help="阅读状态管理")
 config_app = typer.Typer(help="配置管理")
+source_app = typer.Typer(help="源路由与诊断")
 app.add_typer(sub_app, name="sub")
 app.add_typer(read_app, name="read")
 app.add_typer(config_app, name="config")
+app.add_typer(source_app, name="source")
 
 
 class ViewMode(str, Enum):
@@ -113,6 +131,20 @@ def _build_runtime():
         recommender=recommender,
         sync_overlap_seconds=settings.sync_overlap_seconds,
         incremental_sync_enabled=settings.incremental_sync_enabled,
+        source_gateway=SourceGateway(
+            providers=[
+                ManualSourceProvider(feed_provider=provider),
+                TemplateMirrorSourceProvider(templates=settings.source_templates, feed_provider=provider),
+                Wechat2RssIndexProvider(index_url=settings.wechat2rss_index_url, feed_provider=provider),
+            ],
+            router=SourceRouter(),
+            health_service=SourceHealthService(
+                fail_threshold=settings.source_circuit_fail_threshold,
+                cooldown_minutes=settings.source_cooldown_minutes,
+            ),
+            max_candidates=settings.source_max_candidates,
+            retry_backoff_ms=settings.source_retry_backoff_ms,
+        ),
     )
     return provider, sync_service
 
@@ -151,7 +183,12 @@ def _round_robin_by_source(items: list[ArticleViewItem]) -> list[ArticleViewItem
     return result
 
 
-def _query_article_items(session, target_date: date, mode: str) -> list[ArticleViewItem]:
+def _query_article_items(
+    session,
+    target_date: date,
+    mode: str,
+    allowed_sources: set[str] | None = None,
+) -> list[ArticleViewItem]:
     day_start, day_end = _day_bounds(target_date)
     day_id_by_article_pk, _ = _build_day_id_maps(session=session, target_date=target_date)
 
@@ -227,6 +264,9 @@ def _query_article_items(session, target_date: date, mode: str) -> list[ArticleV
         for row in rows
     ]
 
+    if allowed_sources is not None:
+        items = [item for item in items if item.source_name in allowed_sources]
+
     if mode == "recommend":
         read_count = session.scalar(select(func.count()).select_from(ReadState).where(ReadState.is_read.is_(True))) or 0
         if read_count == 0:
@@ -256,6 +296,76 @@ def _sync_run_new_stats(session, run_id: int) -> tuple[int, list[str]]:
         if status == SYNC_ITEM_STATUS_SUCCESS and count == 0:
             no_new_sources.append(str(source_name))
     return new_total, no_new_sources
+
+
+def _source_last_ok_by_subscription(session) -> dict[int, datetime]:
+    rows = session.execute(
+        select(SourceHealth.subscription_id, func.max(SourceHealth.last_ok_at)).group_by(SourceHealth.subscription_id)
+    ).all()
+    return {int(sub_id): last_ok for sub_id, last_ok in rows if last_ok is not None}
+
+
+def _sync_run_live_metrics(
+    session,
+    *,
+    run_id: int,
+    target_date: date,
+    strict_live: bool = False,
+) -> tuple[int, int, int, dict[str, str]]:
+    rows = session.execute(
+        select(Subscription.id, Subscription.name, SyncRunItem.status)
+        .join(Subscription, Subscription.id == SyncRunItem.subscription_id)
+        .where(SyncRunItem.sync_run_id == run_id)
+        .order_by(Subscription.name.asc())
+    ).all()
+    day_start, day_end = _day_bounds(target_date)
+    last_ok_by_sub = _source_last_ok_by_subscription(session)
+
+    live_ok = 0
+    live_failed = 0
+    stale_used = 0
+    source_status_lines: dict[str, str] = {}
+    for sub_id, source_name, status in rows:
+        if status == SYNC_ITEM_STATUS_SUCCESS:
+            live_ok += 1
+            source_status_lines[str(source_name)] = "实时成功"
+            continue
+
+        live_failed += 1
+        has_cached = bool(
+            session.scalar(
+                select(func.count())
+                .select_from(Article)
+                .where(
+                    Article.subscription_id == sub_id,
+                    Article.published_at >= day_start,
+                    Article.published_at < day_end,
+                )
+            )
+            or 0
+        )
+        if has_cached and not strict_live:
+            stale_used += 1
+            lag_hours = stale_hours(last_ok_by_sub.get(int(sub_id)), now=utcnow())
+            if lag_hours is None:
+                source_status_lines[str(source_name)] = "使用缓存(延迟未知)"
+            else:
+                source_status_lines[str(source_name)] = f"使用缓存(延迟{lag_hours}小时)"
+        else:
+            source_status_lines[str(source_name)] = "完全失败(待修复)"
+    return live_ok, live_failed, stale_used, source_status_lines
+
+
+def _live_success_source_names(session, run_id: int) -> set[str]:
+    rows = session.execute(
+        select(Subscription.name)
+        .join(SyncRunItem, SyncRunItem.subscription_id == Subscription.id)
+        .where(
+            SyncRunItem.sync_run_id == run_id,
+            SyncRunItem.status == SYNC_ITEM_STATUS_SUCCESS,
+        )
+    ).all()
+    return {str(name) for (name,) in rows}
 
 
 def _build_day_id_maps(session, target_date: date) -> tuple[dict[int, int], dict[int, int]]:
@@ -301,6 +411,7 @@ def _render_subscription_table(subscriptions: list[Subscription]) -> str:
     table.add_column("公众号")
     table.add_column("微信号")
     table.add_column("状态")
+    table.add_column("优先Provider")
     table.add_column("源URL")
     table.add_column("错误信息")
 
@@ -309,6 +420,7 @@ def _render_subscription_table(subscriptions: list[Subscription]) -> str:
             sub.name,
             sub.wechat_id,
             sub.source_status,
+            sub.preferred_provider or "-",
             sub.source_url or "-",
             sub.last_error or "-",
         )
@@ -405,6 +517,50 @@ def _mask_secret(value: str | None) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
+def _pin_subscription_source(
+    session,
+    *,
+    sub: Subscription,
+    provider: str,
+    url: str,
+) -> None:
+    current_sources = session.scalars(
+        select(SubscriptionSource).where(SubscriptionSource.subscription_id == sub.id)
+    ).all()
+    for row in current_sources:
+        row.is_pinned = False
+
+    source = session.scalar(
+        select(SubscriptionSource).where(
+            SubscriptionSource.subscription_id == sub.id,
+            SubscriptionSource.provider == provider,
+            SubscriptionSource.source_url == url,
+        )
+    )
+    if source is None:
+        source = SubscriptionSource(
+            subscription_id=sub.id,
+            provider=provider,
+            source_url=url,
+            priority=0,
+            is_pinned=True,
+            is_active=True,
+            confidence=1.0 if provider == MANUAL_PROVIDER else 0.8,
+            metadata_json='{"pinned_by":"user"}',
+        )
+        session.add(source)
+    else:
+        source.priority = 0
+        source.is_pinned = True
+        source.is_active = True
+        source.confidence = max(float(source.confidence or 0.0), 0.8)
+
+    sub.source_url = url
+    sub.preferred_provider = provider
+    sub.source_status = SOURCE_STATUS_ACTIVE
+    sub.last_error = None
+
+
 def _bulk_mark_read(ids_raw: str, is_read: bool, target_date: date) -> None:
     settings = get_settings()
     init_db(settings)
@@ -447,6 +603,7 @@ def _interactive_read_loop(
     target_date: date,
     mode_value: str,
     source_names: list[str] | None = None,
+    source_status_lines: dict[str, str] | None = None,
 ) -> None:
     service = ReadStateService()
 
@@ -465,7 +622,15 @@ def _interactive_read_loop(
             return
         if raw.lower() in {"p", "print"}:
             items = _query_article_items(session=session, target_date=target_date, mode=mode_value)
-            typer.echo(render_article_items(items=items, mode=mode_value, source_names=source_names), nl=False)
+            typer.echo(
+                render_article_items(
+                    items=items,
+                    mode=mode_value,
+                    source_names=source_names,
+                    source_status_lines=source_status_lines,
+                ),
+                nl=False,
+            )
             continue
 
         pieces = raw.split(maxsplit=1)
@@ -533,7 +698,15 @@ def _interactive_read_loop(
         session.commit()
         items = _query_article_items(session=session, target_date=target_date, mode=mode_value)
         typer.echo(f"已更新 {changed} 篇文章状态。")
-        typer.echo(render_article_items(items=items, mode=mode_value, source_names=source_names), nl=False)
+        typer.echo(
+            render_article_items(
+                items=items,
+                mode=mode_value,
+                source_names=source_names,
+                source_status_lines=source_status_lines,
+            ),
+            nl=False,
+        )
 
 
 @app.command("status")
@@ -571,6 +744,20 @@ def status() -> None:
             typer.echo("失败项:")
             for name, error_message in failed_items:
                 typer.echo(f"- {name}: {error_message or '未知错误'}")
+
+        error_rows = session.execute(
+            select(FetchAttempt.provider, FetchAttempt.error_kind, func.count())
+            .where(
+                FetchAttempt.sync_run_id == run.id,
+                FetchAttempt.status == FETCH_STATUS_FAILED,
+            )
+            .group_by(FetchAttempt.provider, FetchAttempt.error_kind)
+            .order_by(func.count().desc())
+        ).all()
+        if error_rows:
+            typer.echo("错误聚合(provider + error_kind):")
+            for provider_name, error_kind, count in error_rows:
+                typer.echo(f"- {provider_name}:{error_kind or 'UNKNOWN'} -> {count}")
     _echo_ai_footer(settings)
 
 
@@ -740,11 +927,201 @@ def sub_set_source(
             _echo_ai_footer(settings)
             return
 
-        sub.source_url = url
-        sub.source_status = SOURCE_STATUS_ACTIVE
-        sub.last_error = None
+        _pin_subscription_source(
+            session=session,
+            sub=sub,
+            provider=MANUAL_PROVIDER,
+            url=url,
+        )
         session.commit()
         typer.echo(f"已更新源: {wechat_id}")
+    _echo_ai_footer(settings)
+
+
+@source_app.command("list")
+def source_list(
+    wechat_id: str = typer.Option(..., "--wechat-id"),
+) -> None:
+    """查看某个订阅号的候选源列表与健康状态。"""
+
+    settings = get_settings()
+    init_db(settings)
+    with session_scope(settings) as session:
+        sub = session.scalar(select(Subscription).where(Subscription.wechat_id == wechat_id))
+        if sub is None:
+            typer.echo(f"未找到订阅: {wechat_id}")
+            _echo_ai_footer(settings)
+            return
+
+        rows = session.execute(
+            select(
+                SubscriptionSource.provider,
+                SubscriptionSource.source_url,
+                SubscriptionSource.is_pinned,
+                SubscriptionSource.is_active,
+                SubscriptionSource.priority,
+                SourceHealth.state,
+                SourceHealth.score,
+                SourceHealth.last_error,
+            )
+            .outerjoin(
+                SourceHealth,
+                and_(
+                    SourceHealth.subscription_id == SubscriptionSource.subscription_id,
+                    SourceHealth.provider == SubscriptionSource.provider,
+                    SourceHealth.source_url == SubscriptionSource.source_url,
+                ),
+            )
+            .where(SubscriptionSource.subscription_id == sub.id)
+            .order_by(SubscriptionSource.is_pinned.desc(), SubscriptionSource.priority.asc())
+        ).all()
+        if not rows:
+            typer.echo("暂无候选源记录。")
+            _echo_ai_footer(settings)
+            return
+
+        console = Console(record=True, force_terminal=False, color_system=None, width=180)
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Provider", width=16)
+        table.add_column("Pinned", width=8)
+        table.add_column("Active", width=8)
+        table.add_column("Priority", width=8)
+        table.add_column("Health", width=10)
+        table.add_column("Score", width=8)
+        table.add_column("URL", overflow="fold")
+        table.add_column("LastError", overflow="fold")
+
+        for row in rows:
+            table.add_row(
+                str(row[0]),
+                "yes" if bool(row[2]) else "no",
+                "yes" if bool(row[3]) else "no",
+                str(row[4]),
+                str(row[5] or "-"),
+                f"{float(row[6] or 0.0):.1f}",
+                str(row[1]),
+                str(row[7] or "-"),
+            )
+        with console.capture() as capture:
+            console.print(table)
+        typer.echo(capture.get(), nl=False)
+    _echo_ai_footer(settings)
+
+
+@source_app.command("pin")
+def source_pin(
+    wechat_id: str = typer.Option(..., "--wechat-id"),
+    provider: str = typer.Option(..., "--provider"),
+    url: str = typer.Option(..., "--url"),
+) -> None:
+    """手工指定并置顶一个候选源。"""
+
+    settings = get_settings()
+    init_db(settings)
+    with session_scope(settings) as session:
+        sub = session.scalar(select(Subscription).where(Subscription.wechat_id == wechat_id))
+        if sub is None:
+            typer.echo(f"未找到订阅: {wechat_id}")
+            _echo_ai_footer(settings)
+            return
+        _pin_subscription_source(
+            session=session,
+            sub=sub,
+            provider=provider.strip() or MANUAL_PROVIDER,
+            url=url.strip(),
+        )
+        session.commit()
+        typer.echo(f"已置顶源: {wechat_id} -> {provider}")
+    _echo_ai_footer(settings)
+
+
+@source_app.command("unpin")
+def source_unpin(
+    wechat_id: str = typer.Option(..., "--wechat-id"),
+) -> None:
+    """取消一个订阅号的 pinned 源。"""
+
+    settings = get_settings()
+    init_db(settings)
+    with session_scope(settings) as session:
+        sub = session.scalar(select(Subscription).where(Subscription.wechat_id == wechat_id))
+        if sub is None:
+            typer.echo(f"未找到订阅: {wechat_id}")
+            _echo_ai_footer(settings)
+            return
+        rows = session.scalars(
+            select(SubscriptionSource).where(
+                SubscriptionSource.subscription_id == sub.id,
+                SubscriptionSource.is_pinned.is_(True),
+            )
+        ).all()
+        for row in rows:
+            row.is_pinned = False
+        session.commit()
+        typer.echo(f"已取消置顶源: {wechat_id}")
+    _echo_ai_footer(settings)
+
+
+@source_app.command("doctor")
+def source_doctor(
+    wechat_id: str | None = typer.Option(None, "--wechat-id"),
+) -> None:
+    """诊断源状态并给出修复建议。"""
+
+    settings = get_settings()
+    init_db(settings)
+    with session_scope(settings) as session:
+        stmt = select(Subscription)
+        if wechat_id:
+            stmt = stmt.where(Subscription.wechat_id == wechat_id)
+        subscriptions = session.scalars(stmt.order_by(Subscription.name.asc())).all()
+        if not subscriptions:
+            typer.echo("未找到可诊断的订阅。")
+            _echo_ai_footer(settings)
+            return
+
+        latest_run_id = session.scalar(select(SyncRun.id).order_by(SyncRun.started_at.desc()).limit(1))
+        latest_errors: dict[int, str] = {}
+        if latest_run_id is not None:
+            for sub_id, error in session.execute(
+                select(SyncRunItem.subscription_id, SyncRunItem.error_message).where(
+                    SyncRunItem.sync_run_id == latest_run_id,
+                    SyncRunItem.status == SYNC_ITEM_STATUS_FAILED,
+                )
+            ).all():
+                latest_errors[int(sub_id)] = str(error or "")
+
+        console = Console(record=True, force_terminal=False, color_system=None, width=180)
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("公众号", width=18)
+        table.add_column("状态", width=12)
+        table.add_column("健康分", width=8)
+        table.add_column("建议", overflow="fold")
+        table.add_column("最近错误", overflow="fold")
+
+        for sub in subscriptions:
+            top_health = session.scalar(
+                select(SourceHealth)
+                .where(SourceHealth.subscription_id == sub.id)
+                .order_by(SourceHealth.score.desc())
+                .limit(1)
+            )
+            score = float(top_health.score) if top_health else 0.0
+            state = str(top_health.state) if top_health else "UNKNOWN"
+            last_error = latest_errors.get(sub.id) or sub.last_error or "-"
+            if state == HEALTH_STATE_OPEN:
+                advice = "源熔断中，稍后自动半开重试；可先手工 source pin。"
+            elif score < 40:
+                advice = "健康分偏低，建议 source pin 绑定稳定源。"
+            elif sub.source_status != SOURCE_STATUS_ACTIVE:
+                advice = "当前未激活，建议执行 view 触发自动修复。"
+            else:
+                advice = "状态正常，可继续观察。"
+            table.add_row(sub.name, state, f"{score:.1f}", advice, last_error)
+
+        with console.capture() as capture:
+            console.print(table)
+        typer.echo(capture.get(), nl=False)
     _echo_ai_footer(settings)
 
 
@@ -752,6 +1129,7 @@ def sub_set_source(
 def view(
     mode: ViewMode | None = typer.Option(None, "--mode", help="source/time/recommend"),
     date_text: str | None = typer.Option(None, "--date", help="YYYY-MM-DD，默认当天"),
+    strict_live: bool = typer.Option(False, "--strict-live", help="只展示本次实时抓取成功的订阅数据"),
     interactive: bool | None = typer.Option(
         None,
         "--interactive/--no-interactive",
@@ -779,13 +1157,34 @@ def view(
             run = sync_service.sync(session=session, target_date=target_date, trigger="view")
             session.commit()
 
-            items = _query_article_items(session=session, target_date=target_date, mode=mode_value)
+            allowed_sources = _live_success_source_names(session=session, run_id=run.id) if strict_live else None
+            items = _query_article_items(
+                session=session,
+                target_date=target_date,
+                mode=mode_value,
+                allowed_sources=allowed_sources,
+            )
             source_names = _all_subscription_names(session) if mode_value == "source" else None
             new_total, no_new_sources = _sync_run_new_stats(session=session, run_id=run.id)
-            typer.echo(f"同步完成: success={run.success_count}, fail={run.fail_count}, new={new_total}")
+            live_ok, live_failed, stale_used, source_status_lines = _sync_run_live_metrics(
+                session=session,
+                run_id=run.id,
+                target_date=target_date,
+                strict_live=strict_live,
+            )
+            typer.echo(
+                "同步完成: "
+                f"success={run.success_count}, fail={run.fail_count}, new={new_total}, "
+                f"live_sources_ok={live_ok}, live_sources_failed={live_failed}, stale_sources_used={stale_used}"
+            )
             if no_new_sources:
                 typer.echo(f"本轮无新增: {'、'.join(no_new_sources)}")
-            rendered = render_article_items(items=items, mode=mode_value, source_names=source_names)
+            rendered = render_article_items(
+                items=items,
+                mode=mode_value,
+                source_names=source_names,
+                source_status_lines=source_status_lines if mode_value == "source" else None,
+            )
             typer.echo(rendered, nl=False)
             if interactive_enabled and items:
                 _interactive_read_loop(
@@ -793,6 +1192,7 @@ def view(
                     target_date=target_date,
                     mode_value=mode_value,
                     source_names=source_names,
+                    source_status_lines=source_status_lines if mode_value == "source" else None,
                 )
     finally:
         provider.close()
@@ -826,7 +1226,11 @@ def history(
     with session_scope(settings) as session:
         items = _query_article_items(session=session, target_date=target_date, mode=mode_value)
         source_names = _all_subscription_names(session) if mode_value == "source" else None
-        rendered = render_article_items(items=items, mode=mode_value, source_names=source_names)
+        rendered = render_article_items(
+            items=items,
+            mode=mode_value,
+            source_names=source_names,
+        )
         typer.echo(f"历史查询: date={target_date.isoformat()}, mode={mode_value}")
         typer.echo(rendered, nl=False)
         if interactive_enabled and items:
@@ -937,7 +1341,7 @@ def quick_remove(
     sub_remove(wechat_id=wechat_id)
 
 
-@app.command("source")
+@app.command("set-source")
 def quick_source(
     wechat_id: str = typer.Option(..., "--id", "-i"),
     url: str = typer.Option(..., "--url"),
@@ -951,6 +1355,7 @@ def quick_source(
 def quick_show(
     mode: ViewMode | None = typer.Option(None, "--mode", "-m"),
     date_text: str | None = typer.Option(None, "--date", "-d"),
+    strict_live: bool = typer.Option(False, "--strict-live"),
     interactive: bool | None = typer.Option(None, "--interactive/--no-interactive"),
 ) -> None:
     """快捷命令：查看文章（会先同步）。"""
@@ -958,6 +1363,7 @@ def quick_show(
     view(
         mode=mode,
         date_text=date_text,
+        strict_live=strict_live,
         interactive=interactive,
     )
 

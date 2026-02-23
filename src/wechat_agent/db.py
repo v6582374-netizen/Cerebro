@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 
+from sqlalchemy import text
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -48,7 +49,9 @@ def init_db(settings: Settings | None = None) -> None:
 
     from . import models  # noqa: F401
 
-    Base.metadata.create_all(bind=get_engine(active_settings))
+    engine = get_engine(active_settings)
+    Base.metadata.create_all(bind=engine)
+    _sqlite_auto_migrate(engine=engine, db_url=active_settings.db_url)
 
 
 @contextmanager
@@ -60,3 +63,24 @@ def session_scope(settings: Settings | None = None):
         yield session
     finally:
         session.close()
+
+
+def _sqlite_auto_migrate(engine: Engine, db_url: str) -> None:
+    if not db_url.startswith("sqlite"):
+        return
+
+    required_columns = {
+        "subscriptions": {
+            "preferred_provider": "VARCHAR(64)",
+            "source_mode": "VARCHAR(32) NOT NULL DEFAULT 'auto'",
+        },
+    }
+
+    with engine.begin() as conn:
+        for table_name, columns in required_columns.items():
+            rows = conn.execute(text(f"PRAGMA table_info('{table_name}')")).mappings().all()
+            existing = {str(row["name"]) for row in rows}
+            for column_name, ddl in columns.items():
+                if column_name in existing:
+                    continue
+                conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}"))

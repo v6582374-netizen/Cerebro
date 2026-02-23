@@ -38,6 +38,10 @@ class Settings:
     midnight_shift_days: int
     sync_overlap_seconds: int
     incremental_sync_enabled: bool
+    source_max_candidates: int
+    source_retry_backoff_ms: int
+    source_circuit_fail_threshold: int
+    source_cooldown_minutes: int
 
     def resolved_ai_provider(self) -> str:
         provider = self.ai_provider.strip().lower()
@@ -165,4 +169,8 @@ def get_settings() -> Settings:
         midnight_shift_days=_to_int(os.getenv("MIDNIGHT_SHIFT_DAYS"), 2),
         sync_overlap_seconds=_to_int(os.getenv("SYNC_OVERLAP_SECONDS"), 120),
         incremental_sync_enabled=_to_bool(os.getenv("INCREMENTAL_SYNC_ENABLED"), True),
+        source_max_candidates=_to_int(os.getenv("SOURCE_MAX_CANDIDATES"), 3),
+        source_retry_backoff_ms=_to_int(os.getenv("SOURCE_RETRY_BACKOFF_MS"), 800),
+        source_circuit_fail_threshold=_to_int(os.getenv("SOURCE_CIRCUIT_FAIL_THRESHOLD"), 3),
+        source_cooldown_minutes=_to_int(os.getenv("SOURCE_COOLDOWN_MINUTES"), 30),
     )

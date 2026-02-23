@@ -54,3 +54,34 @@ class ArticleViewItem:
     summary: str
     is_read: bool
     score: float | None = None
+
+
+@dataclass(slots=True)
+class SourceCandidate:
+    subscription_id: int
+    provider: str
+    url: str
+    priority: int = 100
+    is_pinned: bool = False
+    confidence: float = 0.0
+    discovered_at: datetime | None = None
+    metadata_json: str | None = None
+
+
+@dataclass(slots=True)
+class ProbeResult:
+    ok: bool
+    article_count: int = 0
+    latency_ms: int = 0
+    error_kind: str | None = None
+    error_message: str | None = None
+
+
+@dataclass(slots=True)
+class SourceFetchResult:
+    ok: bool
+    candidate: SourceCandidate
+    articles: list[RawArticle]
+    latency_ms: int
+    error_kind: str | None = None
+    error_message: str | None = None
