@@ -21,6 +21,7 @@ from ..models import (
     HEALTH_STATE_HALF_OPEN,
     HEALTH_STATE_OPEN,
     FetchAttempt,
+    SOURCE_MODE_MANUAL,
     SourceHealth,
     Subscription,
     SubscriptionSource,
@@ -32,6 +33,7 @@ from ..schemas import ProbeResult, RawArticle, SourceCandidate, SourceFetchResul
 MANUAL_PROVIDER = "manual"
 RSSHUB_MIRROR_PROVIDER = "rsshub_mirror"
 WECHAT2RSS_PROVIDER = "wechat2rss_index"
+WECHAT2RSS_MIN_SCORE = 6
 
 
 class SourceProvider(Protocol):
@@ -52,6 +54,13 @@ def _normalize_name(value: str) -> str:
     lowered = re.sub(r"\s+", "", lowered)
     lowered = re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", lowered)
     return lowered
+
+
+def _extract_ascii_tokens(value: str) -> list[str]:
+    normalized = _normalize_name(value)
+    if not normalized:
+        return []
+    return [token for token in re.findall(r"[a-z0-9]{3,}", normalized)]
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -133,7 +142,7 @@ class ManualSourceProvider:
                 )
             )
 
-        if sub.source_url:
+        if sub.source_url and sub.source_mode == SOURCE_MODE_MANUAL:
             if not any(c.url == sub.source_url for c in candidates):
                 candidates.append(
                     SourceCandidate(
@@ -239,10 +248,17 @@ class Wechat2RssIndexProvider:
 
         normalized_name = _normalize_name(sub.name)
         normalized_id = _normalize_name(sub.wechat_id)
+        ascii_tokens = sorted(set(_extract_ascii_tokens(sub.name) + _extract_ascii_tokens(sub.wechat_id)))
         now = utcnow()
         ranked: list[tuple[int, _Wechat2RssItem]] = []
         for item in items:
-            score = max(self._match_score(normalized_name, item.normalized_name), self._match_score(normalized_id, item.normalized_name))
+            if ascii_tokens and not all(token in item.normalized_name for token in ascii_tokens):
+                continue
+            score = self._candidate_score(
+                normalized_name=normalized_name,
+                normalized_id=normalized_id,
+                item_name=item.normalized_name,
+            )
             if score <= 0:
                 continue
             ranked.append((score, item))
@@ -284,10 +300,19 @@ class Wechat2RssIndexProvider:
             return 100
         if a in b or b in a:
             return min(len(a), len(b))
-        common = len(set(a) & set(b))
-        if common >= 2 and (common / max(len(a), len(b))) >= 0.5:
-            return common
         return 0
+
+    def _candidate_score(self, normalized_name: str, normalized_id: str, item_name: str) -> int:
+        id_score = self._match_score(normalized_id, item_name)
+        name_score = self._match_score(normalized_name, item_name)
+
+        # For subscriptions with explicit wechat_id, demand stronger matching to avoid false positives.
+        if normalized_id and len(normalized_id) >= 4 and id_score < 4:
+            return 0
+        # Baseline threshold to avoid low-confidence accidental matches.
+        if max(id_score, name_score) < WECHAT2RSS_MIN_SCORE:
+            return 0
+        return max(id_score, name_score)
 
     def _load_items(self) -> list[_Wechat2RssItem]:
         if self._cache is not None:
@@ -532,6 +557,9 @@ class SourceGateway:
         self.retry_backoff_ms = max(retry_backoff_ms, 0)
 
     def discover_candidates(self, session: Session, sub: Subscription) -> list[SourceCandidate]:
+        self._demote_legacy_manual_sources(session=session, sub=sub)
+        self._deactivate_weak_wechat2rss_sources(session=session, sub=sub)
+        session.flush()
         now = utcnow()
         dedup: dict[tuple[str, str], SourceCandidate] = {}
         for provider in self.providers.values():
@@ -735,6 +763,39 @@ class SourceGateway:
             existing.metadata_json = candidate.metadata_json
         if candidate.discovered_at is not None:
             existing.discovered_at = candidate.discovered_at
+
+    def _demote_legacy_manual_sources(self, session: Session, sub: Subscription) -> None:
+        rows = session.scalars(
+            select(SubscriptionSource).where(
+                SubscriptionSource.subscription_id == sub.id,
+                SubscriptionSource.provider == MANUAL_PROVIDER,
+            )
+        ).all()
+        for row in rows:
+            metadata = str(row.metadata_json or "")
+            if '"legacy":true' not in metadata:
+                continue
+            row.is_pinned = False
+            row.is_active = False
+            row.priority = max(int(row.priority or 0), 95)
+
+    def _deactivate_weak_wechat2rss_sources(self, session: Session, sub: Subscription) -> None:
+        rows = session.scalars(
+            select(SubscriptionSource).where(
+                SubscriptionSource.subscription_id == sub.id,
+                SubscriptionSource.provider == WECHAT2RSS_PROVIDER,
+                SubscriptionSource.is_active.is_(True),
+            )
+        ).all()
+        for row in rows:
+            score = 0
+            try:
+                metadata = json.loads(row.metadata_json or "{}")
+                score = int(metadata.get("score") or 0)
+            except Exception:
+                score = 0
+            if score < WECHAT2RSS_MIN_SCORE:
+                row.is_active = False
 
 
 def stale_hours(last_ok_at: datetime | None, now: datetime | None = None) -> int | None:

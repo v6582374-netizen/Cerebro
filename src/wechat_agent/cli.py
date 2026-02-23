@@ -29,6 +29,8 @@ from .models import (
     ReadState,
     RecommendationScoreEntry,
     SOURCE_STATUS_ACTIVE,
+    SOURCE_MODE_AUTO,
+    SOURCE_MODE_MANUAL,
     SOURCE_STATUS_PENDING,
     SourceHealth,
     Subscription,
@@ -557,6 +559,7 @@ def _pin_subscription_source(
 
     sub.source_url = url
     sub.preferred_provider = provider
+    sub.source_mode = SOURCE_MODE_MANUAL if provider == MANUAL_PROVIDER else SOURCE_MODE_AUTO
     sub.source_status = SOURCE_STATUS_ACTIVE
     sub.last_error = None
 
@@ -1057,6 +1060,9 @@ def source_unpin(
         ).all()
         for row in rows:
             row.is_pinned = False
+        sub.source_mode = SOURCE_MODE_AUTO
+        if sub.preferred_provider == MANUAL_PROVIDER:
+            sub.preferred_provider = None
         session.commit()
         typer.echo(f"已取消置顶源: {wechat_id}")
     _echo_ai_footer(settings)

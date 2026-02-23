@@ -14,7 +14,6 @@ from ..models import (
     SYNC_ITEM_STATUS_FAILED,
     SYNC_ITEM_STATUS_SUCCESS,
     Subscription,
-    SubscriptionSource,
     SyncRun,
     SyncRunItem,
     utcnow,
@@ -23,7 +22,7 @@ from ..schemas import RawArticle
 from ..time_utils import local_day_bounds_utc
 from .fetcher import Fetcher
 from .recommender import Recommender
-from .source_gateway import MANUAL_PROVIDER, SourceGateway
+from .source_gateway import SourceGateway
 from .source_resolver import SourceResolver
 from .summarizer import Summarizer
 
@@ -211,8 +210,6 @@ class SyncService:
         sub.source_status = SOURCE_STATUS_ACTIVE
         sub.last_error = None
 
-        # Keep legacy source_url compatible by mirroring it as a pinned manual source.
-        self._ensure_manual_legacy_source(session=session, sub=sub)
         self._record_success_items(
             session=session,
             run=run,
@@ -353,28 +350,3 @@ class SyncService:
             if len(compact) >= 48 and compact[-1] not in {"。", "！", "？", "!", "?"}:
                 return True
         return False
-
-    def _ensure_manual_legacy_source(self, session: Session, sub: Subscription) -> None:
-        if not sub.source_url:
-            return
-        existing = session.scalar(
-            select(SubscriptionSource).where(
-                SubscriptionSource.subscription_id == sub.id,
-                SubscriptionSource.provider == MANUAL_PROVIDER,
-                SubscriptionSource.source_url == sub.source_url,
-            )
-        )
-        if existing is not None:
-            return
-        session.add(
-            SubscriptionSource(
-                subscription_id=sub.id,
-                provider=MANUAL_PROVIDER,
-                source_url=sub.source_url,
-                priority=0,
-                is_pinned=True,
-                is_active=True,
-                confidence=1.0,
-                metadata_json='{"legacy":true}',
-            )
-        )
