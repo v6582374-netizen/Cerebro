@@ -489,8 +489,9 @@ def _render_subscription_table(subscriptions: list[Subscription]) -> str:
             sub.last_error or "-",
         )
 
-    console.print(table)
-    return console.export_text()
+    with console.capture() as capture:
+        console.print(table)
+    return capture.get()
 
 
 def _parse_id_list(raw_ids: str) -> list[int]:

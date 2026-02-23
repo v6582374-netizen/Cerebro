@@ -139,6 +139,16 @@ def test_non_view_commands_append_ai_footer(isolated_env):
     assert "AI: provider=" in not_found.stdout
 
 
+def test_sub_list_renders_single_table(isolated_env):
+    add = runner.invoke(app, ["sub", "add", "--name", "号A", "--wechat-id", "gh_a"])
+    assert add.exit_code == 0
+
+    listed = runner.invoke(app, ["sub", "list"])
+    assert listed.exit_code == 0
+    assert listed.stdout.count("┏") == 1
+    assert listed.stdout.count("公众号") == 1
+
+
 def test_quick_alias_commands(isolated_env, monkeypatch):
     monkeypatch.setattr("wechat_agent.providers.template_feed_provider.TemplateFeedProvider.fetch", _fake_fetch)
     monkeypatch.setattr("wechat_agent.providers.template_feed_provider.TemplateFeedProvider.probe", _fake_probe)

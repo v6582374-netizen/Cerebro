@@ -190,6 +190,12 @@ class DiscoveryOrchestrator:
                 raise RuntimeError("AUTH_EXPIRED: 登录态缺失")
             search_fn = getattr(provider, "search")
             return search_fn(sub.name, target_date, token)
+        if provider.name == "search_index":
+            search_fn = getattr(provider, "search")
+            try:
+                return search_fn(sub.name, target_date, extra_keywords=[sub.wechat_id])
+            except TypeError:
+                return search_fn(sub.name, target_date)
         search_fn = getattr(provider, "search")
         return search_fn(sub.name, target_date)
 

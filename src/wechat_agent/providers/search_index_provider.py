@@ -3,17 +3,26 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 import html
 from html.parser import HTMLParser
-from urllib.parse import parse_qs, unquote, urlencode, urlparse
+import re
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 
 from ..schemas import DiscoveredArticleRef
 
+_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+_MP_LINK_RE = re.compile(r"https?://mp\.weixin\.qq\.com/s\?[^\s\"'<>]+", re.IGNORECASE)
+_MP_LINK_ESCAPED_RE = re.compile(r"https:\\/\\/mp\\.weixin\\.qq\\.com\\/s\\?[^\s\"'<>]+", re.IGNORECASE)
+
 
 def _normalize_mp_link(raw: str) -> str | None:
     if not raw:
         return None
-    href = html.unescape(raw).strip()
+    href = html.unescape(raw).strip().rstrip(").,;]")
+    href = href.replace("\\u002F", "/").replace("\\/", "/")
     if href.startswith("//"):
         href = f"https:{href}"
     if href.startswith("/l/?"):
@@ -28,6 +37,26 @@ def _normalize_mp_link(raw: str) -> str | None:
     if not parsed.path.startswith("/s"):
         return None
     return href
+
+
+def _extract_mp_links_from_text(raw_text: str) -> list[str]:
+    if not raw_text:
+        return []
+    text = html.unescape(raw_text)
+    extracted: list[str] = []
+    for match in _MP_LINK_RE.findall(text):
+        extracted.append(match)
+    for match in _MP_LINK_ESCAPED_RE.findall(text):
+        extracted.append(match.replace("\\/", "/"))
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for item in extracted:
+        normalized = _normalize_mp_link(item)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        dedup.append(normalized)
+    return dedup
 
 
 class _DuckResultParser(HTMLParser):
@@ -74,80 +103,145 @@ class SearchIndexProvider:
         if self._owns_client:
             self.client.close()
 
-    def search(self, subscription_name: str, target_date: date, limit: int = 8) -> list[DiscoveredArticleRef]:
-        query = f'site:mp.weixin.qq.com "{subscription_name}" {target_date.isoformat()}'
-        params = urlencode({"q": query})
-        url = f"https://duckduckgo.com/html/?{params}"
-        response = self.client.get(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            },
-        )
-        response.raise_for_status()
-        parser = _DuckResultParser()
-        parser.feed(response.text)
-        parser.close()
+    def search(
+        self,
+        subscription_name: str,
+        target_date: date,
+        extra_keywords: list[str] | None = None,
+        limit: int = 8,
+    ) -> list[DiscoveredArticleRef]:
+        keywords = [subscription_name.strip()]
+        for keyword in extra_keywords or []:
+            cleaned = (keyword or "").strip()
+            if cleaned and cleaned not in keywords:
+                keywords.append(cleaned)
+
+        queries: list[str] = []
+        for keyword in keywords:
+            queries.extend(
+                [
+                    f'site:mp.weixin.qq.com "{keyword}"',
+                    f'site:mp.weixin.qq.com/s "{keyword}"',
+                    f'"{keyword}" 微信公众号',
+                ]
+            )
+        queries.append(f'site:mp.weixin.qq.com "{subscription_name}" {target_date.isoformat()}')
 
         refs: list[DiscoveredArticleRef] = []
         seen: set[str] = set()
-        for rank, (raw_href, title) in enumerate(parser.items, start=1):
-            normalized = _normalize_mp_link(raw_href)
-            if not normalized or normalized in seen:
+        for query_index, query in enumerate(queries):
+            if len(refs) >= limit:
+                break
+            query_factor = max(0.6, 1.0 - (query_index * 0.08))
+            for row in self.search_by_query(query=query, limit=limit, target_date=target_date):
+                if row.url in seen:
+                    continue
+                seen.add(row.url)
+                row.confidence = max(0.2, row.confidence * query_factor)
+                refs.append(row)
+                if len(refs) >= limit:
+                    break
+        return refs
+
+    def search_by_query(self, query: str, limit: int = 6, target_date: date | None = None) -> list[DiscoveredArticleRef]:
+        refs: list[DiscoveredArticleRef] = []
+        seen: set[str] = set()
+
+        engines = (
+            ("duckduckgo", "https://duckduckgo.com/html/", 0.85),
+            ("bing", "https://www.bing.com/search", 0.75),
+        )
+        for _engine_name, endpoint, base_conf in engines:
+            html_text = self._fetch_engine_html(endpoint=endpoint, query=query)
+            if not html_text:
                 continue
-            seen.add(normalized)
-            confidence = max(0.2, 1.0 - ((rank - 1) * 0.1))
-            refs.append(
-                DiscoveredArticleRef(
-                    url=normalized,
-                    title_hint=title or None,
-                    published_at_hint=datetime.combine(target_date, datetime.min.time(), tzinfo=timezone.utc),
-                    channel=self.name,
-                    confidence=confidence,
+
+            parser = _DuckResultParser()
+            parser.feed(html_text)
+            parser.close()
+
+            rank = 0
+            for raw_href, title in parser.items:
+                normalized = _normalize_mp_link(raw_href)
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                confidence = max(0.2, base_conf - (rank * 0.05))
+                refs.append(
+                    DiscoveredArticleRef(
+                        url=normalized,
+                        title_hint=title or None,
+                        published_at_hint=(
+                            datetime.combine(target_date, datetime.min.time(), tzinfo=timezone.utc)
+                            if target_date is not None
+                            else None
+                        ),
+                        channel=self.name,
+                        confidence=confidence,
+                    )
                 )
-            )
+                rank += 1
+                if len(refs) >= limit:
+                    break
+            if len(refs) >= limit:
+                break
+
+            # Regex fallback: some engines embed links in script/json, not plain anchors.
+            for idx, normalized in enumerate(_extract_mp_links_from_text(html_text), start=1):
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                confidence = max(0.2, base_conf - ((idx + 3) * 0.05))
+                refs.append(
+                    DiscoveredArticleRef(
+                        url=normalized,
+                        title_hint=None,
+                        published_at_hint=(
+                            datetime.combine(target_date, datetime.min.time(), tzinfo=timezone.utc)
+                            if target_date is not None
+                            else None
+                        ),
+                        channel=self.name,
+                        confidence=confidence,
+                    )
+                )
+                if len(refs) >= limit:
+                    break
             if len(refs) >= limit:
                 break
         return refs
 
-    def search_by_query(self, query: str, limit: int = 6) -> list[DiscoveredArticleRef]:
-        params = urlencode({"q": query})
-        url = f"https://duckduckgo.com/html/?{params}"
-        response = self.client.get(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                )
-            },
-        )
-        response.raise_for_status()
-        parser = _DuckResultParser()
-        parser.feed(response.text)
-        parser.close()
+    def _fetch_engine_html(self, endpoint: str, query: str) -> str:
+        try:
+            response = self.client.get(
+                endpoint,
+                params={"q": query},
+                headers={
+                    "User-Agent": _UA,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+                },
+            )
+            response.raise_for_status()
+            return response.text
+        except Exception:
+            return ""
 
-        refs: list[DiscoveredArticleRef] = []
+    # Backward-compatible helper for older tests/extensions.
+    def extract_links(self, html_text: str) -> list[str]:
+        links: list[str] = []
         seen: set[str] = set()
-        for rank, (raw_href, title) in enumerate(parser.items, start=1):
+        parser = _DuckResultParser()
+        parser.feed(html_text)
+        parser.close()
+        for raw_href, _title in parser.items:
             normalized = _normalize_mp_link(raw_href)
             if not normalized or normalized in seen:
                 continue
             seen.add(normalized)
-            confidence = max(0.2, 1.0 - ((rank - 1) * 0.1))
-            refs.append(
-                DiscoveredArticleRef(
-                    url=normalized,
-                    title_hint=title or None,
-                    published_at_hint=None,
-                    channel=self.name,
-                    confidence=confidence,
-                )
-            )
-            if len(refs) >= limit:
-                break
-        return refs
+            links.append(normalized)
+        for normalized in _extract_mp_links_from_text(html_text):
+            if normalized not in seen:
+                seen.add(normalized)
+                links.append(normalized)
+        return links
