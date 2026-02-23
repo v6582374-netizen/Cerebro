@@ -8,7 +8,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
-DEFAULT_TEMPLATE = "https://rsshub.app/wechat/mp/{wechat_id}"
+DEFAULT_SOURCE_TEMPLATES = (
+    "https://rsshub.app/wechat/mp/{wechat_id}",
+    "https://rsshub.rssforever.com/wechat/mp/{wechat_id}",
+)
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
@@ -81,7 +84,7 @@ class Settings:
 
 def _parse_source_templates(raw: str | None) -> tuple[str, ...]:
     if not raw:
-        return (DEFAULT_TEMPLATE,)
+        return DEFAULT_SOURCE_TEMPLATES
 
     templates: list[str] = []
     for item in raw.split(","):
@@ -93,7 +96,7 @@ def _parse_source_templates(raw: str | None) -> tuple[str, ...]:
         templates.append(candidate)
 
     if not templates:
-        return (DEFAULT_TEMPLATE,)
+        return DEFAULT_SOURCE_TEMPLATES
     return tuple(templates)
 
 

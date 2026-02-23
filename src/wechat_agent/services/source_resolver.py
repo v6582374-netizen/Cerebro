@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 from dataclasses import dataclass
+from urllib.parse import urljoin
 
 import httpx
 
@@ -22,6 +24,7 @@ _ANCHOR_PATTERN = re.compile(
     r'<a href="(?P<url>https://wechat2rss\.xlab\.app/feed/[^"]+\.xml)"[^>]*>(?P<name>.*?)</a>',
     re.IGNORECASE,
 )
+_VITEPRESS_HASH_MAP_PATTERN = re.compile(r'window\.__VP_HASH_MAP__=JSON\.parse\("(?P<data>.*?)"\);', re.DOTALL)
 
 
 def _normalize_name(value: str) -> str:
@@ -109,8 +112,26 @@ class SourceResolver:
         response.raise_for_status()
         body = response.text
 
-        items: list[Wechat2RssItem] = []
-        for match in _ANCHOR_PATTERN.finditer(body):
+        items = self._extract_items_from_text(body)
+        if not items:
+            fallback_assets = self._extract_vitepress_assets(body)
+            for asset_url in fallback_assets:
+                try:
+                    asset_resp = httpx.get(asset_url, timeout=20, follow_redirects=True)
+                    asset_resp.raise_for_status()
+                except Exception:  # noqa: BLE001
+                    continue
+                extracted = self._extract_items_from_text(asset_resp.text)
+                if extracted:
+                    items = extracted
+                    break
+
+        self._wechat2rss_cache = items
+        return items
+
+    def _extract_items_from_text(self, text: str) -> list[Wechat2RssItem]:
+        dedup: dict[str, Wechat2RssItem] = {}
+        for match in _ANCHOR_PATTERN.finditer(text):
             raw_name = html.unescape(match.group("name")).strip()
             url = match.group("url").strip()
             if not raw_name:
@@ -118,10 +139,26 @@ class SourceResolver:
             normalized = _normalize_name(raw_name)
             if not normalized:
                 continue
-            items.append(Wechat2RssItem(name=raw_name, feed_url=url, normalized_name=normalized))
+            dedup[url] = Wechat2RssItem(name=raw_name, feed_url=url, normalized_name=normalized)
+        return list(dedup.values())
 
-        self._wechat2rss_cache = items
-        return items
+    def _extract_vitepress_assets(self, index_html: str) -> list[str]:
+        match = _VITEPRESS_HASH_MAP_PATTERN.search(index_html)
+        if not match:
+            return []
+        try:
+            escaped = match.group("data")
+            hash_map = json.loads(escaped.encode("utf-8").decode("unicode_escape"))
+        except Exception:  # noqa: BLE001
+            return []
+
+        hash_value = hash_map.get("list_all.md")
+        if not hash_value:
+            return []
+        return [
+            urljoin(self.wechat2rss_index_url or "", f"/assets/list_all.md.{hash_value}.js"),
+            urljoin(self.wechat2rss_index_url or "", f"/assets/list_all.md.{hash_value}.lean.js"),
+        ]
 
     def _match_score(self, a: str, b: str) -> int:
         if a == b:
